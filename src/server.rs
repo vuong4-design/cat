@@ -962,6 +962,7 @@ mod tests {
         let app = app_state.lock().await;
         assert!(app.usage_totals.total_tokens > 0);
         assert_eq!(app.usage_totals.tool_call_count, 1);
+        assert_eq!(app.session_usage_totals, app.usage_totals);
         assert!(matches!(app.mode, Mode::Both));
         assert!(matches!(app.tool_mode, ToolMode::MultiTools));
         drop(app);
@@ -1014,11 +1015,6 @@ async fn post_mcp(State(s): State<ServerState>, body_bytes: Bytes) -> Response<B
             .body(Body::empty())
             .unwrap();
     }
-
-    let mut usage_totals = {
-        let app = s.app.lock().await;
-        app.usage_totals.clone()
-    };
 
     let request_summary = summarize_request(&body);
     let request_flow_event = request_flow_label(&body);
@@ -1076,11 +1072,15 @@ async fn post_mcp(State(s): State<ServerState>, body_bytes: Bytes) -> Response<B
     {
         let mut resp = resp;
         if req.method == "tools/call" {
-            if let Some((input_tokens, output_tokens)) =
-                extract_turn_token_usage(resp.result.as_ref())
-            {
-                usage_totals.accumulate(input_tokens, output_tokens, 1);
-            }
+            let turn_token_usage = extract_turn_token_usage(resp.result.as_ref());
+            let usage_totals = {
+                let mut app = s.app.lock().await;
+                if let Some((input_tokens, output_tokens)) = turn_token_usage {
+                    app.record_turn_usage(input_tokens, output_tokens);
+                    app.persist_state_with_log();
+                }
+                app.usage_totals.clone()
+            };
             attach_history_usage(&mut resp.result, &usage_totals);
             attach_catdesk_instruction_actions(
                 &mut resp.result,
@@ -1093,11 +1093,7 @@ async fn post_mcp(State(s): State<ServerState>, body_bytes: Bytes) -> Response<B
     }
 
     {
-        let mut app = s.app.lock().await;
-        if app.usage_totals != usage_totals {
-            app.usage_totals = usage_totals.clone();
-            app.persist_state_with_log();
-        }
+        let app = s.app.lock().await;
         let mcp_path = app.mcp_path();
         drop(app);
         if req.id.is_some() {

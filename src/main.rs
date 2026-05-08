@@ -44,6 +44,9 @@ const REMOTE_CONNECT_UI_GRACE_MS: u128 = 8_000;
 const UI_POLL_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 6;
 const STATUS_LABEL_WIDTH: usize = 19;
+const GPT55_INPUT_USD_PER_1M: f64 = 5.0;
+const GPT55_OUTPUT_USD_PER_1M: f64 = 30.0;
+const PRICE_DISPLAY_DECIMALS: usize = 6;
 const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
 
 // ── Selection ───────────────────────────────────────────────
@@ -210,6 +213,75 @@ fn trim_line(text: &str, max_chars: usize) -> String {
         .iter()
         .collect::<String>();
     format!("{kept}...")
+}
+
+fn format_token_compact(value: u64) -> String {
+    if value < 1_000 {
+        return value.to_string();
+    }
+
+    let (unit, suffix) = if value >= 1_000_000_000 {
+        (1_000_000_000.0, "B")
+    } else if value >= 1_000_000 {
+        (1_000_000.0, "M")
+    } else {
+        (1_000.0, "K")
+    };
+    let scaled = value as f64 / unit;
+    let decimals = if scaled >= 100.0 { 0 } else { 1 };
+    let formatted = format!("{scaled:.prec$}", prec = decimals);
+    format!("{}{}", formatted.trim_end_matches(".0"), suffix)
+}
+
+fn estimate_gpt55_usage_cost_usd(usage: &UsageTotals) -> f64 {
+    (usage.input_tokens as f64 * GPT55_OUTPUT_USD_PER_1M
+        + usage.output_tokens as f64 * GPT55_INPUT_USD_PER_1M)
+        / 1_000_000.0
+}
+
+fn format_usd_compact(usd: f64) -> String {
+    let formatted = format!("{usd:.prec$}", prec = PRICE_DISPLAY_DECIMALS);
+    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn session_usage_line(
+    usage: &UsageTotals,
+    status_label: Span<'static>,
+    palette: &theme::Palette,
+) -> Line<'static> {
+    let label_style = Style::default().fg(palette.muted_fg);
+    let value_style = Style::default()
+        .fg(palette.secondary_fg)
+        .add_modifier(Modifier::BOLD);
+    let price_style = Style::default()
+        .fg(palette.success_fg)
+        .add_modifier(Modifier::BOLD);
+
+    Line::from(vec![
+        status_label,
+        Span::styled("↓", label_style),
+        Span::styled(format_token_compact(usage.input_tokens), value_style),
+        Span::raw("  "),
+        Span::styled("↑", label_style),
+        Span::styled(format_token_compact(usage.output_tokens), value_style),
+        Span::raw("  "),
+        Span::styled("Σ", label_style),
+        Span::styled(format_token_compact(usage.total_tokens), value_style),
+        Span::raw("  "),
+        Span::styled("ƒ", label_style),
+        Span::styled(format_token_compact(usage.tool_call_count), value_style),
+        Span::raw("  "),
+        Span::styled("$", label_style),
+        Span::styled(
+            format_usd_compact(estimate_gpt55_usage_cost_usd(usage)),
+            price_style,
+        ),
+    ])
 }
 
 fn flow_call_offset(text: &str) -> String {
@@ -2817,13 +2889,8 @@ fn draw_ui(
             status_label_style,
         )
     };
-    let status_inner_height = status_height.saturating_sub(2) as usize;
+    let status_content_height = status_height.saturating_sub(4) as usize;
     let flow_block_lines = 2;
-    let visible_flow_slots = if show_flow_panel {
-        status_inner_height.saturating_sub(12 + 1 + 2) / flow_block_lines.max(1)
-    } else {
-        0
-    };
 
     let mut status_lines: Vec<Line> = vec![
         Line::from(vec![
@@ -2914,6 +2981,11 @@ fn draw_ui(
             }
             Line::from(spans)
         },
+        session_usage_line(
+            &app.session_usage_totals,
+            status_label("Session:"),
+            &palette,
+        ),
     ];
 
     if !show_guide {
@@ -2947,6 +3019,12 @@ fn draw_ui(
             ),
         ]));
     }
+
+    let visible_flow_slots = if show_flow_panel {
+        status_content_height.saturating_sub(status_lines.len() + 1) / flow_block_lines.max(1)
+    } else {
+        0
+    };
 
     if show_flow_panel && visible_flow_slots > 0 {
         status_lines.push(Line::from(""));

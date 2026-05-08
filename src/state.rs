@@ -45,7 +45,7 @@ pub struct FlowBootstrapProgress {
 const APP_CONFIG_DIR_NAME: &str = ".catdesk";
 const APP_CONFIG_FILE_NAME: &str = "config.toml";
 
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageTotals {
     pub input_tokens: u64,
@@ -482,6 +482,7 @@ pub struct AppState {
     pub flow_bootstrap_progress: HashMap<String, FlowBootstrapProgress>,
     pub request_count: u64,
     pub usage_totals: UsageTotals,
+    pub session_usage_totals: UsageTotals,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
     pub ngrok_task: Option<tokio::task::JoinHandle<()>>,
@@ -863,6 +864,7 @@ impl AppState {
             flow_bootstrap_progress: HashMap::new(),
             request_count: 0,
             usage_totals: config.usage_totals,
+            session_usage_totals: UsageTotals::default(),
             config_path,
             server_handle: None,
             ngrok_task: None,
@@ -917,6 +919,12 @@ impl AppState {
         if let Err(e) = self.persist_state() {
             self.log("WARN", format!("Failed to persist app state: {e}"));
         }
+    }
+
+    pub fn record_turn_usage(&mut self, input_tokens: u64, output_tokens: u64) {
+        self.usage_totals.accumulate(input_tokens, output_tokens, 1);
+        self.session_usage_totals
+            .accumulate(input_tokens, output_tokens, 1);
     }
 
     pub fn apply_server_ui_event(&mut self, event: ServerUiEvent) {
@@ -1160,6 +1168,7 @@ toolCallCount = 7
         assert_eq!(app.usage_totals.output_tokens, 34);
         assert_eq!(app.usage_totals.total_tokens, 154);
         assert_eq!(app.usage_totals.tool_call_count, 7);
+        assert_eq!(app.session_usage_totals, UsageTotals::default());
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir(workspace);
@@ -1185,6 +1194,7 @@ toolCallCount = 7
         app.mode = Mode::Computer;
         app.tool_mode = ToolMode::ReadOnly;
         app.usage_totals.accumulate(12, 8, 3);
+        app.session_usage_totals.accumulate(100, 200, 1);
         app.persist_state().expect("persist state");
 
         let saved = AppConfig::load_from_path(&config_path).expect("load config file");
@@ -1195,6 +1205,15 @@ toolCallCount = 7
         assert_eq!(saved.usage_totals.output_tokens, 8);
         assert_eq!(saved.usage_totals.total_tokens, 20);
         assert_eq!(saved.usage_totals.tool_call_count, 3);
+
+        let reloaded = AppState::from_config_path(
+            8787,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("reload app state");
+        assert_eq!(reloaded.usage_totals.total_tokens, 20);
+        assert_eq!(reloaded.session_usage_totals, UsageTotals::default());
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir(workspace);
