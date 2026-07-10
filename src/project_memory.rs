@@ -92,6 +92,26 @@ impl ProjectMemoryUpdateOutput {
     }
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionResumeOutput {
+    pub document: MemoryDocument,
+    pub session_goal: String,
+    pub files_changed: Vec<String>,
+    pub verification_results: String,
+    pub remaining_work: String,
+    pub resume_prompt: String,
+}
+
+impl SessionResumeOutput {
+    pub fn render_text(&self) -> String {
+        format!(
+            "updated: {}\npath: {}\nsections: session goal, files changed, verification results, remaining work, resume prompt",
+            self.document.name, self.document.path
+        )
+    }
+}
+
 fn workspace_root_path(workspace_root: &str) -> Result<PathBuf, String> {
     Path::new(workspace_root)
         .canonicalize()
@@ -180,6 +200,55 @@ fn append_markdown(existing: &str, content: &str, section: Option<&str>) -> Stri
     text
 }
 
+fn markdown_block(text: &str) -> String {
+    let text = normalize_markdown(text.trim());
+    if text.trim().is_empty() {
+        "_None recorded._\n".to_string()
+    } else {
+        text
+    }
+}
+
+fn markdown_list(items: &[String]) -> String {
+    let items = items
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return "- None recorded.\n".to_string();
+    }
+    let mut out = String::new();
+    for item in items {
+        out.push_str("- ");
+        out.push_str(item);
+        out.push('\n');
+    }
+    out
+}
+
+fn session_resume_text(
+    session_goal: &str,
+    files_changed: &[String],
+    verification_results: &str,
+    remaining_work: &str,
+    resume_prompt: &str,
+) -> String {
+    format!(
+        "# Session\n\n\
+## Session goal\n\n{}\
+\n## Files changed\n\n{}\
+\n## Verification results\n\n{}\
+\n## Remaining work\n\n{}\
+\n## Resume prompt\n\n{}",
+        markdown_block(session_goal),
+        markdown_list(files_changed),
+        markdown_block(verification_results),
+        markdown_block(remaining_work),
+        markdown_block(resume_prompt),
+    )
+}
+
 pub fn init(workspace_root: &str) -> Result<ProjectMemoryOutput, String> {
     let root = workspace_root_path(workspace_root)?;
     ensure_memory_files(&root)?;
@@ -246,6 +315,36 @@ pub fn update(
     })
 }
 
+pub fn update_session_resume(
+    workspace_root: &str,
+    session_goal: &str,
+    files_changed: Vec<String>,
+    verification_results: &str,
+    remaining_work: &str,
+    resume_prompt: &str,
+) -> Result<SessionResumeOutput, String> {
+    let root = workspace_root_path(workspace_root)?;
+    ensure_memory_files(&root)?;
+    let def = document_def("session").expect("session memory document exists");
+    let path = memory_root(&root).join(def.file_name);
+    let content = session_resume_text(
+        session_goal,
+        &files_changed,
+        verification_results,
+        remaining_work,
+        resume_prompt,
+    );
+    fs::write(&path, content).map_err(|e| e.to_string())?;
+    Ok(SessionResumeOutput {
+        document: read_document(&root, def)?,
+        session_goal: session_goal.trim().to_string(),
+        files_changed,
+        verification_results: verification_results.trim().to_string(),
+        remaining_work: remaining_work.trim().to_string(),
+        resume_prompt: resume_prompt.trim().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +389,42 @@ mod tests {
             .expect("read decisions");
         assert!(text.contains("## Architecture"));
         assert!(text.contains("- Use markdown files for project memory."));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn update_session_resume_writes_required_sections() {
+        let workspace = test_workspace("session-resume");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let output = update_session_resume(
+            &workspace.to_string_lossy(),
+            "Improve CatDesk",
+            vec![
+                "src/project_memory.rs".to_string(),
+                "src/mcp.rs".to_string(),
+            ],
+            "cargo test project_memory passed",
+            "Implement repository map",
+            "Continue with Task 7",
+        )
+        .expect("update session resume");
+
+        assert_eq!(output.document.name, "session");
+        let text = fs::read_to_string(workspace.join(MEMORY_DIR).join("session.md"))
+            .expect("read session memory");
+        for heading in [
+            "## Session goal",
+            "## Files changed",
+            "## Verification results",
+            "## Remaining work",
+            "## Resume prompt",
+        ] {
+            assert!(text.contains(heading), "missing heading {heading}");
+        }
+        assert!(text.contains("- src/project_memory.rs"));
+        assert!(text.contains("Continue with Task 7"));
 
         let _ = fs::remove_dir_all(workspace);
     }

@@ -449,6 +449,45 @@ async fn handle_tools_list(
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }));
             tools.push(json!({
+                "name": "session_resume_update",
+                "title": "Update session resume",
+                "description": "Create or replace .catdesk/session.md with a structured Markdown handoff for resuming work in a later ChatGPT session.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_goal": {
+                            "type": "string",
+                            "description": "The current session goal."
+                        },
+                        "files_changed": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Workspace-relative files changed in this session."
+                        },
+                        "verification_results": {
+                            "type": "string",
+                            "description": "Verification commands and outcomes."
+                        },
+                        "remaining_work": {
+                            "type": "string",
+                            "description": "Known remaining work or blockers."
+                        },
+                        "resume_prompt": {
+                            "type": "string",
+                            "description": "Prompt to paste into a new session to resume."
+                        }
+                    },
+                    "required": [
+                        "session_goal",
+                        "files_changed",
+                        "verification_results",
+                        "remaining_work",
+                        "resume_prompt"
+                    ]
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
+            }));
+            tools.push(json!({
                 "name": "write",
                 "title": "Write file",
                 "description": "Create or overwrite a file in workspace.",
@@ -568,6 +607,9 @@ async fn handle_tools_call(
                                 }
                                 "project_memory_update" => {
                                     handle_project_memory_update(req, workspace_root)
+                                }
+                                "session_resume_update" => {
+                                    handle_session_resume_update(req, workspace_root)
                                 }
                                 "write" => handle_write_file(req, workspace_root),
                                 "edit" => handle_edit_file(req, workspace_root),
@@ -1220,6 +1262,12 @@ Always specify the branch explicitly when using `git push`."#
             "Use project_memory_read at the start of project work to recover persistent context from .catdesk/*.md. Use project_memory_update to record durable project facts, decisions, todos, and handoff notes."
                 .to_string(),
         );
+        if tool_mode.write_tools_enabled() {
+            lines.push(
+                "Use session_resume_update before ending a work session to refresh .catdesk/session.md with the session goal, files changed, verification results, remaining work, and resume prompt."
+                    .to_string(),
+            );
+        }
         lines.push("Use read to read files and search to search the workspace.".to_string());
         if tool_mode.run_command_enabled() {
             lines.push(
@@ -1507,6 +1555,7 @@ fn tool_descriptor_should_attach_widget(name: &str) -> bool {
             | "project_memory_init"
             | "project_memory_read"
             | "project_memory_update"
+            | "session_resume_update"
             | "search"
             | "read"
             | "write"
@@ -2598,6 +2647,7 @@ fn is_local_destructive_tool(tool_name: &str) -> bool {
         "run_command"
             | "project_memory_init"
             | "project_memory_update"
+            | "session_resume_update"
             | "write"
             | "edit"
             | "delete"
@@ -2727,6 +2777,75 @@ fn handle_project_memory_update(req: &JsonRpcRequest, workspace_root: &str) -> J
                     "document": output.document,
                     "mode": output.mode,
                     "bytes": output.bytes,
+                }),
+            )
+        }
+        Err(e) => tool_error_response(req, e),
+    }
+}
+
+fn string_array_argument(arguments: &Value, name: &str) -> Result<Vec<String>, String> {
+    let Some(value) = arguments.get(name) else {
+        return Err(format!("Missing required parameter: {name}"));
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("Parameter {name} must be an array of strings"));
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("Parameter {name} must be an array of strings"))
+        })
+        .collect()
+}
+
+fn handle_session_resume_update(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let session_goal = match required_string_argument(&arguments, "session_goal") {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+    let files_changed = match string_array_argument(&arguments, "files_changed") {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+    let verification_results = match required_string_argument(&arguments, "verification_results") {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+    let remaining_work = match required_string_argument(&arguments, "remaining_work") {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+    let resume_prompt = match required_string_argument(&arguments, "resume_prompt") {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+
+    match project_memory::update_session_resume(
+        workspace_root,
+        session_goal,
+        files_changed,
+        verification_results,
+        remaining_work,
+        resume_prompt,
+    ) {
+        Ok(output) => {
+            let text = output.render_text();
+            tool_success_response_with_structured(
+                req,
+                text,
+                json!({
+                    "toolName": "session_resume_update",
+                    "document": output.document,
+                    "sessionGoal": output.session_goal,
+                    "filesChanged": output.files_changed,
+                    "verificationResults": output.verification_results,
+                    "remainingWork": output.remaining_work,
+                    "resumePrompt": output.resume_prompt,
                 }),
             )
         }
@@ -3051,6 +3170,7 @@ mod tests {
                 "project_memory_read",
                 "project_memory_init",
                 "project_memory_update",
+                "session_resume_update",
                 "write",
                 "edit",
                 "delete",
@@ -3198,6 +3318,66 @@ mod tests {
             .expect("missing project memory text");
         assert!(text.contains("## Notes"));
         assert!(text.contains("- Remember important context."));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn session_resume_update_writes_required_session_sections() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-session-resume-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let req = tool_call_request(
+            "session_resume_update",
+            json!({
+                "session_goal": "Ship Task 5",
+                "files_changed": ["src/project_memory.rs", "src/mcp.rs"],
+                "verification_results": "cargo test project_memory passed",
+                "remaining_work": "Implement Task 7",
+                "resume_prompt": "Continue with the repository map task."
+            }),
+        );
+        let response = handle_tools_call(
+            &req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&response);
+
+        let text = std::fs::read_to_string(workspace_root.join(".catdesk").join("session.md"))
+            .expect("read session memory");
+        for heading in [
+            "## Session goal",
+            "## Files changed",
+            "## Verification results",
+            "## Remaining work",
+            "## Resume prompt",
+        ] {
+            assert!(text.contains(heading), "missing heading {heading}");
+        }
+        assert!(text.contains("- src/project_memory.rs"));
+        assert!(text.contains("Continue with the repository map task."));
+
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content");
+        assert_eq!(
+            structured.get("toolName").and_then(Value::as_str),
+            Some("session_resume_update")
+        );
+        assert_eq!(
+            structured.get("sessionGoal").and_then(Value::as_str),
+            Some("Ship Task 5")
+        );
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }
