@@ -341,7 +341,8 @@ async fn handle_tools_list(
                     "properties": {
                         "command": { "type": "string", "description": "The shell command to execute" },
                         "cwd": { "type": "string", "description": "Working directory relative to workspace root or absolute path within it" },
-                        "timeout": { "type": "number", "description": "Timeout in milliseconds. Clamped to 120000." }
+                        "timeout": { "type": "number", "description": "Timeout in milliseconds. Clamped to 120000." },
+                        "dry_run": { "type": "boolean", "description": "Preview the command without executing it." }
                     },
                     "required": ["command"]
                 },
@@ -507,7 +508,8 @@ async fn handle_tools_list(
                     "properties": {
                         "path": { "type": "string" },
                         "content": { "type": "string" },
-                        "create_dirs": { "type": "boolean", "description": "Create parent directories if missing" }
+                        "create_dirs": { "type": "boolean", "description": "Create parent directories if missing" },
+                        "dry_run": { "type": "boolean", "description": "Preview the write without changing the file" }
                     },
                     "required": ["path", "content"]
                 },
@@ -523,7 +525,8 @@ async fn handle_tools_list(
                         "path": { "type": "string" },
                         "old_string": { "type": "string", "description": "Exact literal text to replace" },
                         "new_string": { "type": "string", "description": "Exact literal replacement text" },
-                        "replace_all": { "type": "boolean", "description": "Replace all occurrences of old_string (default false)" }
+                        "replace_all": { "type": "boolean", "description": "Replace all occurrences of old_string (default false)" },
+                        "dry_run": { "type": "boolean", "description": "Preview the edit without changing the file" }
                     },
                     "required": ["path", "old_string", "new_string"]
                 },
@@ -537,7 +540,9 @@ async fn handle_tools_list(
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "recursive": { "type": "boolean", "description": "Delete directories recursively" }
+                        "recursive": { "type": "boolean", "description": "Delete directories recursively" },
+                        "confirm": { "type": "boolean", "description": "Must be true to actually delete anything" },
+                        "dry_run": { "type": "boolean", "description": "Preview the delete without removing anything" }
                     },
                     "required": ["path"]
                 },
@@ -761,6 +766,10 @@ async fn handle_run_command(
 
     let cwd_input = arguments.get("cwd").and_then(|v| v.as_str());
     let timeout_ms = arguments.get("timeout").and_then(|v| v.as_u64());
+    let dry_run = arguments
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     if command::contains_catdesk_co_author_marker(cmd) {
         let message = if set_catdesk_as_co_author {
@@ -785,6 +794,27 @@ async fn handle_run_command(
     } else {
         cmd.to_string()
     };
+
+    if dry_run {
+        return tool_success_response_with_structured(
+            req,
+            format!(
+                "dry run: would execute `{effective_command}` in {}",
+                cwd.display()
+            ),
+            json!({
+                "toolName": "run_command",
+                "command": effective_command,
+                "cwd": cwd.to_string_lossy().to_string(),
+                "dryRun": true,
+                "success": true,
+            }),
+        );
+    }
+
+    if let Err(error) = command::validate_shell_safety(&effective_command) {
+        return tool_error_response(req, format!("code: COMMAND_BLOCKED\nmessage: {error}"));
+    }
 
     if let Some(intercept) = command::detect_list_files_intercept(&effective_command) {
         let listing_path =
@@ -2912,6 +2942,37 @@ fn handle_write_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespo
         .get("create_dirs")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let dry_run = arguments
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if dry_run {
+        let target = match command::resolve_workspace_path(workspace_root, Some(path)) {
+            Ok(value) => value,
+            Err(e) => {
+                return tool_error_response(
+                    req,
+                    format!("code: PATH_OUTSIDE_WORKSPACE\nmessage: {e}"),
+                );
+            }
+        };
+        return tool_success_response_with_structured(
+            req,
+            format!(
+                "dry run: would write {} bytes to {}",
+                content.len(),
+                target.display()
+            ),
+            json!({
+                "toolName": "write",
+                "path": path,
+                "bytesWritten": content.len(),
+                "createDirs": create_dirs,
+                "dryRun": true,
+                "message": "dry run: file was not changed",
+            }),
+        );
+    }
     match workspace_tools::write_file(workspace_root, path, content, create_dirs) {
         Ok(text) => {
             let message = text.clone();
@@ -2949,6 +3010,44 @@ fn handle_edit_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespon
         .get("replace_all")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let dry_run = arguments
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if dry_run {
+        let output = match workspace_tools::read_file(workspace_root, path) {
+            Ok(value) => value,
+            Err(e) => return tool_error_response(req, e),
+        };
+        let replaced_count = output.text.matches(old_string).count();
+        if replaced_count == 0 {
+            return tool_error_response(req, format!("old_string not found in {}", output.path));
+        }
+        if replaced_count > 1 && !replace_all {
+            return tool_error_response(
+                req,
+                format!(
+                    "old_string matched {replaced_count} occurrences in {}. Set replace_all=true to replace every occurrence, or provide more context to make old_string unique.",
+                    output.path
+                ),
+            );
+        }
+        return tool_success_response_with_structured(
+            req,
+            format!(
+                "dry run: would edit {replaced_count} occurrence(s) in {}",
+                output.path
+            ),
+            json!({
+                "toolName": "edit",
+                "path": path,
+                "replaceAll": replace_all,
+                "dryRun": true,
+                "matchedOccurrences": replaced_count,
+                "message": "dry run: file was not changed",
+            }),
+        );
+    }
     match workspace_tools::edit_file(workspace_root, path, old_string, new_string, replace_all) {
         Ok(text) => {
             let message = text.clone();
@@ -3109,6 +3208,50 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
         .get("recursive")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let confirm = arguments
+        .get("confirm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let dry_run = arguments
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if dry_run {
+        let target = match command::resolve_workspace_path(workspace_root, Some(path)) {
+            Ok(value) => value,
+            Err(e) => {
+                return tool_error_response(
+                    req,
+                    format!("code: PATH_OUTSIDE_WORKSPACE\nmessage: {e}"),
+                );
+            }
+        };
+        let kind = match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_dir() => "directory",
+            Ok(metadata) if metadata.file_type().is_file() => "file",
+            Ok(_) => "path",
+            Err(_) => "missing path",
+        };
+        return tool_success_response_with_structured(
+            req,
+            format!("dry run: would delete {kind}: {}", target.display()),
+            json!({
+                "toolName": "delete",
+                "path": path,
+                "recursive": recursive,
+                "confirm": confirm,
+                "dryRun": true,
+                "kind": kind,
+                "message": "dry run: path was not deleted",
+            }),
+        );
+    }
+    if !confirm {
+        return tool_error_response(
+            req,
+            "Delete requires confirm=true. Use dry_run=true to preview the delete first.".into(),
+        );
+    }
     match workspace_tools::delete_path(workspace_root, path, recursive) {
         Ok(text) => {
             let message = text.clone();
@@ -3650,6 +3793,126 @@ mod tests {
         assert_eq!(
             result_text(&response),
             "max_matches must be between 1 and 500"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn run_command_blocks_dangerous_delete_commands() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-command-safety-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+
+        let req = tool_call_request(
+            "run_command",
+            json!({
+                "command": "rm -rf notes.txt",
+            }),
+        );
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let response = handle_tools_call(
+            &req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+
+        assert_no_text_content(&response);
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("COMMAND_BLOCKED"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn destructive_tools_support_dry_run_and_delete_confirmation() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-dry-run-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::write(workspace_root.join("notes.txt"), "hello\n").expect("write notes");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let write_req = tool_call_request(
+            "write",
+            json!({
+                "path": "notes.txt",
+                "content": "changed\n",
+                "dry_run": true
+            }),
+        );
+        let write_response = handle_tools_call(
+            &write_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&write_response);
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("notes.txt")).expect("read notes"),
+            "hello\n"
+        );
+
+        let delete_req = tool_call_request("delete", json!({ "path": "notes.txt" }));
+        let delete_response = handle_tools_call(
+            &delete_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&delete_response);
+        assert_eq!(
+            delete_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(workspace_root.join("notes.txt").is_file());
+        assert!(result_text(&delete_response).contains("confirm=true"));
+
+        let dry_delete_req =
+            tool_call_request("delete", json!({ "path": "notes.txt", "dry_run": true }));
+        let dry_delete_response = handle_tools_call(
+            &dry_delete_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&dry_delete_response);
+        assert!(workspace_root.join("notes.txt").is_file());
+        let structured = dry_delete_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content");
+        assert_eq!(
+            structured.get("dryRun").and_then(Value::as_bool),
+            Some(true)
         );
 
         let _ = std::fs::remove_dir_all(workspace_root);
@@ -4338,7 +4601,7 @@ mod tests {
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         std::fs::write(workspace_root.join("notes.txt"), "hello world\n").expect("write file");
 
-        let req = tool_call_request("delete", json!({ "path": "notes.txt" }));
+        let req = tool_call_request("delete", json!({ "path": "notes.txt", "confirm": true }));
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
         let response = handle_tools_call(
             &req,

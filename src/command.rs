@@ -170,6 +170,75 @@ pub fn detect_move_path_intercept(command: &str) -> Option<InterceptedMovePathRe
     detect_move_path_intercept_from_words(&words)
 }
 
+pub fn validate_shell_safety(command: &str) -> Result<(), String> {
+    for segment in shell_segments(command) {
+        validate_shell_segment_safety(&segment)?;
+    }
+    Ok(())
+}
+
+fn validate_shell_segment_safety(segment: &str) -> Result<(), String> {
+    let words = shell_words(segment);
+    let Some(command_idx) = command_start_index(&words, |_| true) else {
+        return Ok(());
+    };
+    let command = command_basename(&words[command_idx].lower);
+    if is_shell_command(&command) {
+        if let Some(payload) = nested_shell_command(segment) {
+            return validate_shell_safety(&payload.command);
+        }
+    }
+    if command == "powershell"
+        || command == "powershell.exe"
+        || command == "pwsh"
+        || command == "pwsh.exe"
+    {
+        if let Some(nested_idx) = words.iter().position(|word| {
+            matches!(
+                word.lower.as_str(),
+                "-command" | "-c" | "/command" | "/c" | "-encodedcommand" | "/encodedcommand"
+            )
+        }) {
+            if matches!(
+                words[nested_idx].lower.as_str(),
+                "-encodedcommand" | "/encodedcommand"
+            ) {
+                return Err(
+                    "Blocked dangerous shell command: encoded PowerShell commands are not allowed"
+                        .into(),
+                );
+            }
+            if let Some(payload) = words.get(nested_idx + 1) {
+                return validate_shell_safety(&payload.text);
+            }
+        }
+    }
+
+    match command.as_str() {
+        "rm" | "del" | "erase" | "rd" | "rmdir" | "remove-item" | "ri" | "format"
+        | "format.com" | "shutdown" | "reboot" | "restart-computer" | "stop-computer" => {
+            Err(format!(
+                "Blocked dangerous shell command: {command}. Use a dedicated CatDesk tool with explicit confirmation instead."
+            ))
+        }
+        "git"
+            if words
+                .get(command_idx + 1)
+                .is_some_and(|word| word.lower == "clean") =>
+        {
+            Err("Blocked dangerous shell command: git clean".into())
+        }
+        "reg"
+            if words
+                .get(command_idx + 1)
+                .is_some_and(|word| word.lower == "delete") =>
+        {
+            Err("Blocked dangerous shell command: reg delete".into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Execute a shell command via the platform shell.
 pub async fn run_command(command: &str, cwd: &Path, timeout_ms: u64) -> CommandResult {
     let start = Instant::now();
@@ -1078,6 +1147,15 @@ mod tests {
             "bash -lc 'git commit -m \"x\"'"
         ));
         assert!(!command_contains_git_commit("echo git commit"));
+    }
+
+    #[test]
+    fn validate_shell_safety_blocks_dangerous_commands() {
+        assert!(validate_shell_safety("rm -rf notes.txt").is_err());
+        assert!(validate_shell_safety("git clean -fdx").is_err());
+        assert!(validate_shell_safety("bash -lc 'rm -rf notes.txt'").is_err());
+        assert!(validate_shell_safety("powershell -Command 'Remove-Item notes.txt'").is_err());
+        assert!(validate_shell_safety("cargo test").is_ok());
     }
 
     #[test]
