@@ -6,6 +6,7 @@ mod macos_terminal;
 mod mascot;
 mod mcp;
 mod ngrok;
+mod project_memory;
 mod server;
 mod state;
 mod theme;

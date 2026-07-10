@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use crate::command;
 use crate::devtools::DevtoolsBridge;
 use crate::mascot;
+use crate::project_memory;
 use crate::state::{
     AgentsPathMode, Mode, ShowDetailMode, TokenStatsLayout, ToolMode, app_config_path,
     load_app_config, user_home_dir,
@@ -394,8 +395,59 @@ async fn handle_tools_list(
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
         }));
+        tools.push(json!({
+            "name": "project_memory_read",
+            "title": "Read project memory",
+            "description": "Read Markdown project memory files from .catdesk. Automatically initializes missing files.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "document": {
+                        "type": "string",
+                        "description": "Optional memory document to read: project, decisions, todo, or session."
+                    }
+                }
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
 
         if tool_mode.write_tools_enabled() {
+            tools.push(json!({
+                "name": "project_memory_init",
+                "title": "Initialize project memory",
+                "description": "Create missing Markdown project memory files under .catdesk and return their current content.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": false }
+            }));
+            tools.push(json!({
+                "name": "project_memory_update",
+                "title": "Update project memory",
+                "description": "Append to or overwrite one Markdown project memory file in .catdesk. Automatically initializes missing files.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "document": {
+                            "type": "string",
+                            "description": "Memory document to update: project, decisions, todo, or session."
+                        },
+                        "content": { "type": "string", "description": "Markdown content to write." },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["append", "overwrite"],
+                            "description": "Update mode. Defaults to append."
+                        },
+                        "section": {
+                            "type": "string",
+                            "description": "Optional heading to add before appended content."
+                        }
+                    },
+                    "required": ["document", "content"]
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
+            }));
             tools.push(json!({
                 "name": "write",
                 "title": "Write file",
@@ -507,9 +559,16 @@ async fn handle_tools_call(
                     ),
                     "read" => handle_read_file(req, workspace_root),
                     "search" => handle_search_text(req, workspace_root),
+                    "project_memory_read" => handle_project_memory_read(req, workspace_root),
                     _ => {
                         if tool_mode.write_tools_enabled() {
                             match tool_name.as_str() {
+                                "project_memory_init" => {
+                                    handle_project_memory_init(req, workspace_root)
+                                }
+                                "project_memory_update" => {
+                                    handle_project_memory_update(req, workspace_root)
+                                }
                                 "write" => handle_write_file(req, workspace_root),
                                 "edit" => handle_edit_file(req, workspace_root),
                                 "delete" => handle_delete_path(req, workspace_root),
@@ -1157,6 +1216,10 @@ Always specify the branch explicitly when using `git push`."#
         .collect();
 
     if mode.computer_enabled() {
+        lines.push(
+            "Use project_memory_read at the start of project work to recover persistent context from .catdesk/*.md. Use project_memory_update to record durable project facts, decisions, todos, and handoff notes."
+                .to_string(),
+        );
         lines.push("Use read to read files and search to search the workspace.".to_string());
         if tool_mode.run_command_enabled() {
             lines.push(
@@ -1439,7 +1502,16 @@ fn attach_tool_call_count(result: &mut Value, tool_call_count: u64) {
 fn tool_descriptor_should_attach_widget(name: &str) -> bool {
     matches!(
         name,
-        "run_command" | "catdesk_instruction" | "search" | "read" | "write" | "edit" | "delete"
+        "run_command"
+            | "catdesk_instruction"
+            | "project_memory_init"
+            | "project_memory_read"
+            | "project_memory_update"
+            | "search"
+            | "read"
+            | "write"
+            | "edit"
+            | "delete"
     )
 }
 
@@ -2521,7 +2593,15 @@ fn diff_changed_files(before: &WatchedSnapshot, after: &WatchedSnapshot) -> Vec<
 }
 
 fn is_local_destructive_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "run_command" | "write" | "edit" | "delete")
+    matches!(
+        tool_name,
+        "run_command"
+            | "project_memory_init"
+            | "project_memory_update"
+            | "write"
+            | "edit"
+            | "delete"
+    )
 }
 
 fn tool_is_read_only(tool: &Value) -> bool {
@@ -2579,6 +2659,77 @@ fn handle_read_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespon
                 "truncated": output.truncated,
             }),
         ),
+        Err(e) => tool_error_response(req, e),
+    }
+}
+
+fn project_memory_structured(
+    tool_name: &str,
+    output: project_memory::ProjectMemoryOutput,
+) -> Value {
+    json!({
+        "toolName": tool_name,
+        "root": output.root,
+        "documents": output.documents,
+    })
+}
+
+fn handle_project_memory_init(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    match project_memory::init(workspace_root) {
+        Ok(output) => {
+            let text = output.render_text();
+            tool_success_response_with_structured(
+                req,
+                text,
+                project_memory_structured("project_memory_init", output),
+            )
+        }
+        Err(e) => tool_error_response(req, e),
+    }
+}
+
+fn handle_project_memory_read(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let document = arguments.get("document").and_then(Value::as_str);
+    match project_memory::read(workspace_root, document) {
+        Ok(output) => {
+            let text = output.render_text();
+            tool_success_response_with_structured(
+                req,
+                text,
+                project_memory_structured("project_memory_read", output),
+            )
+        }
+        Err(e) => tool_error_response(req, e),
+    }
+}
+
+fn handle_project_memory_update(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let document = match arguments.get("document").and_then(Value::as_str) {
+        Some(value) => value,
+        None => return tool_error_response(req, "Missing required parameter: document".into()),
+    };
+    let content = match arguments.get("content").and_then(Value::as_str) {
+        Some(value) => value,
+        None => return tool_error_response(req, "Missing required parameter: content".into()),
+    };
+    let mode = arguments.get("mode").and_then(Value::as_str);
+    let section = arguments.get("section").and_then(Value::as_str);
+    match project_memory::update(workspace_root, document, content, mode, section) {
+        Ok(output) => {
+            let text = output.render_text();
+            tool_success_response_with_structured(
+                req,
+                text,
+                json!({
+                    "toolName": "project_memory_update",
+                    "document": output.document,
+                    "mode": output.mode,
+                    "bytes": output.bytes,
+                }),
+            )
+        }
         Err(e) => tool_error_response(req, e),
     }
 }
@@ -2897,6 +3048,9 @@ mod tests {
                 "catdesk_instruction",
                 "read",
                 "search",
+                "project_memory_read",
+                "project_memory_init",
+                "project_memory_update",
                 "write",
                 "edit",
                 "delete",
@@ -2961,7 +3115,91 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["catdesk_instruction", "read", "search"]);
+        assert_eq!(
+            names,
+            vec![
+                "catdesk_instruction",
+                "read",
+                "search",
+                "project_memory_read",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn project_memory_tools_initialize_read_and_update_markdown_files() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-project-memory-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let init_req = tool_call_request("project_memory_init", json!({}));
+        let init_response = handle_tools_call(
+            &init_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&init_response);
+        for file_name in ["project.md", "decisions.md", "todo.md", "session.md"] {
+            assert!(
+                workspace_root.join(".catdesk").join(file_name).is_file(),
+                "missing memory file {file_name}"
+            );
+        }
+
+        let update_req = tool_call_request(
+            "project_memory_update",
+            json!({
+                "document": "project",
+                "content": "- Remember important context.",
+                "section": "Notes"
+            }),
+        );
+        let update_response = handle_tools_call(
+            &update_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&update_response);
+
+        let read_req = tool_call_request("project_memory_read", json!({ "document": "project" }));
+        let read_response = handle_tools_call(
+            &read_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&read_response);
+        let structured = read_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content");
+        let text = structured
+            .get("documents")
+            .and_then(Value::as_array)
+            .and_then(|documents| documents.first())
+            .and_then(|document| document.get("text"))
+            .and_then(Value::as_str)
+            .expect("missing project memory text");
+        assert!(text.contains("## Notes"));
+        assert!(text.contains("- Remember important context."));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
