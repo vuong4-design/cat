@@ -14,6 +14,7 @@ use crate::git_workflow;
 use crate::mascot;
 use crate::planning;
 use crate::project_memory;
+use crate::prompt_templates;
 use crate::repo_map;
 use crate::state::{
     AgentsPathMode, Mode, ShowDetailMode, TokenStatsLayout, ToolMode, app_config_path,
@@ -436,6 +437,32 @@ async fn handle_tools_list(
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
         }));
+        tools.push(json!({
+            "name": "prompt_templates_list",
+            "title": "List prompt templates",
+            "description": "List reusable Markdown prompt templates under .catdesk/prompts. Automatically initializes default templates if missing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+        tools.push(json!({
+            "name": "prompt_template_read",
+            "title": "Read prompt template",
+            "description": "Read one reusable Markdown prompt template from .catdesk/prompts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Template file name or stem, for example implementation-plan or implementation-plan.md."
+                    }
+                },
+                "required": ["name"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
 
         if tool_mode.write_tools_enabled() {
             tools.push(json!({
@@ -522,6 +549,40 @@ async fn handle_tools_list(
                         }
                     },
                     "required": ["index", "done"]
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
+            }));
+            tools.push(json!({
+                "name": "prompt_templates_init",
+                "title": "Initialize prompt templates",
+                "description": "Create .catdesk/prompts with default reusable Markdown prompt templates and return all templates.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": false }
+            }));
+            tools.push(json!({
+                "name": "prompt_template_write",
+                "title": "Write prompt template",
+                "description": "Create or replace one reusable Markdown prompt template under .catdesk/prompts.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Template file name or stem. Only letters, numbers, hyphen, and underscore are allowed."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Markdown template content."
+                        },
+                        "overwrite": {
+                            "type": "boolean",
+                            "description": "Set true to replace an existing template. Defaults to false."
+                        }
+                    },
+                    "required": ["name", "content"]
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }));
@@ -749,6 +810,8 @@ async fn handle_tools_call(
                     "project_memory_read" => handle_project_memory_read(req, workspace_root),
                     "plan_read" => handle_plan_read(req, workspace_root),
                     "task_queue_read" => handle_task_queue_read(req, workspace_root),
+                    "prompt_templates_list" => handle_prompt_templates_list(req, workspace_root),
+                    "prompt_template_read" => handle_prompt_template_read(req, workspace_root),
                     _ => {
                         if tool_mode.write_tools_enabled() {
                             match tool_name.as_str() {
@@ -762,6 +825,12 @@ async fn handle_tools_call(
                                 "task_queue_add" => handle_task_queue_add(req, workspace_root),
                                 "task_queue_set_status" => {
                                     handle_task_queue_set_status(req, workspace_root)
+                                }
+                                "prompt_templates_init" => {
+                                    handle_prompt_templates_init(req, workspace_root)
+                                }
+                                "prompt_template_write" => {
+                                    handle_prompt_template_write(req, workspace_root)
                                 }
                                 "session_resume_update" => {
                                     handle_session_resume_update(req, workspace_root)
@@ -1515,6 +1584,10 @@ Always specify the branch explicitly when using `git push`."#
                     .to_string(),
             );
             lines.push(
+                "Use prompt_templates_list and prompt_template_read to reuse Markdown prompts from .catdesk/prompts. Use prompt_templates_init or prompt_template_write to create reusable project prompts."
+                    .to_string(),
+            );
+            lines.push(
                 "Use session_resume_update before ending a work session to refresh .catdesk/session.md with the session goal, files changed, verification results, remaining work, and resume prompt."
                     .to_string(),
             );
@@ -1815,6 +1888,10 @@ fn tool_descriptor_should_attach_widget(name: &str) -> bool {
             | "task_queue_read"
             | "task_queue_add"
             | "task_queue_set_status"
+            | "prompt_templates_init"
+            | "prompt_templates_list"
+            | "prompt_template_read"
+            | "prompt_template_write"
             | "session_resume_update"
             | "repo_map_generate"
             | "verify_project"
@@ -2922,6 +2999,8 @@ fn is_local_destructive_tool(tool_name: &str) -> bool {
             | "plan_update"
             | "task_queue_add"
             | "task_queue_set_status"
+            | "prompt_templates_init"
+            | "prompt_template_write"
             | "session_resume_update"
             | "repo_map_generate"
             | "git_create_feature_branch"
@@ -3172,6 +3251,95 @@ fn handle_task_queue_set_status(req: &JsonRpcRequest, workspace_root: &str) -> J
                 req,
                 text,
                 task_queue_structured("task_queue_set_status", output),
+            )
+        }
+        Err(e) => tool_error_response(req, e),
+    }
+}
+
+fn prompt_templates_structured(
+    tool_name: &str,
+    output: prompt_templates::PromptTemplatesOutput,
+) -> Value {
+    json!({
+        "toolName": tool_name,
+        "root": output.root,
+        "templates": output.templates,
+    })
+}
+
+fn handle_prompt_templates_init(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    match prompt_templates::init(workspace_root) {
+        Ok(output) => {
+            let text = output.render_text();
+            tool_success_response_with_structured(
+                req,
+                text,
+                prompt_templates_structured("prompt_templates_init", output),
+            )
+        }
+        Err(e) => tool_error_response(req, e),
+    }
+}
+
+fn handle_prompt_templates_list(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    match prompt_templates::list(workspace_root) {
+        Ok(output) => {
+            let text = output.render_text();
+            tool_success_response_with_structured(
+                req,
+                text,
+                prompt_templates_structured("prompt_templates_list", output),
+            )
+        }
+        Err(e) => tool_error_response(req, e),
+    }
+}
+
+fn handle_prompt_template_read(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let name = match required_string_argument(&arguments, "name") {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+    match prompt_templates::read(workspace_root, name) {
+        Ok(output) => {
+            let text = output.render_text();
+            tool_success_response_with_structured(
+                req,
+                text,
+                prompt_templates_structured("prompt_template_read", output),
+            )
+        }
+        Err(e) => tool_error_response(req, e),
+    }
+}
+
+fn handle_prompt_template_write(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let name = match required_string_argument(&arguments, "name") {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+    let content = match required_string_argument(&arguments, "content") {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+    let overwrite = match optional_bool_argument(&arguments, "overwrite", false) {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+    match prompt_templates::write(workspace_root, name, content, overwrite) {
+        Ok(output) => {
+            let text = output.render_text();
+            tool_success_response_with_structured(
+                req,
+                text,
+                json!({
+                    "toolName": "prompt_template_write",
+                    "template": output.template,
+                    "created": output.created,
+                }),
             )
         }
         Err(e) => tool_error_response(req, e),
@@ -3821,11 +3989,15 @@ mod tests {
                 "project_memory_read",
                 "plan_read",
                 "task_queue_read",
+                "prompt_templates_list",
+                "prompt_template_read",
                 "project_memory_init",
                 "project_memory_update",
                 "plan_update",
                 "task_queue_add",
                 "task_queue_set_status",
+                "prompt_templates_init",
+                "prompt_template_write",
                 "session_resume_update",
                 "repo_map_generate",
                 "verify_project",
@@ -3906,6 +4078,8 @@ mod tests {
                 "project_memory_read",
                 "plan_read",
                 "task_queue_read",
+                "prompt_templates_list",
+                "prompt_template_read",
             ]
         );
     }
@@ -4116,6 +4290,110 @@ mod tests {
                 .get("text")
                 .and_then(Value::as_str)
                 .is_some_and(|text| text.contains("- [x] Add task queue MCP test"))
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn prompt_template_tools_init_write_list_and_read_markdown() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-prompt-templates-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let init_req = tool_call_request("prompt_templates_init", json!({}));
+        let init_response = handle_tools_call(
+            &init_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&init_response);
+        assert!(
+            workspace_root
+                .join(".catdesk")
+                .join("prompts")
+                .join("implementation-plan.md")
+                .is_file()
+        );
+
+        let write_req = tool_call_request(
+            "prompt_template_write",
+            json!({
+                "name": "release-notes",
+                "content": "# Release Notes\n\nHighlights:\n"
+            }),
+        );
+        let write_response = handle_tools_call(
+            &write_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&write_response);
+
+        let list_req = tool_call_request("prompt_templates_list", json!({}));
+        let list_response = handle_tools_call(
+            &list_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&list_response);
+        let list_structured = list_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content");
+        assert!(
+            list_structured
+                .get("templates")
+                .and_then(Value::as_array)
+                .is_some_and(|templates| templates
+                    .iter()
+                    .any(|template| template.get("name").and_then(Value::as_str)
+                        == Some("release-notes.md")))
+        );
+
+        let read_req =
+            tool_call_request("prompt_template_read", json!({ "name": "release-notes" }));
+        let read_response = handle_tools_call(
+            &read_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&read_response);
+        let read_structured = read_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content");
+        assert!(
+            read_structured
+                .get("templates")
+                .and_then(Value::as_array)
+                .and_then(|templates| templates.first())
+                .and_then(|template| template.get("text"))
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("Highlights:"))
         );
 
         let _ = std::fs::remove_dir_all(workspace_root);

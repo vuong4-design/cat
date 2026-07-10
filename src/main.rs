@@ -9,6 +9,7 @@ mod mcp;
 mod ngrok;
 mod planning;
 mod project_memory;
+mod prompt_templates;
 mod repo_map;
 mod server;
 mod state;
