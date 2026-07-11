@@ -1,3 +1,4 @@
+use crate::app_info::CATDESK_VERSION;
 use crate::binagotchy_gen;
 use base64::Engine as _;
 use image::{
@@ -176,7 +177,7 @@ fn archive_startup_mascot_to_root(seed: u64, root: &Path) -> std::io::Result<()>
     let metadata = StoredMascotMetadata {
         seed: seed_hex(seed),
         created_at: timestamp,
-        generator_version: env!("CARGO_PKG_VERSION").to_string(),
+        generator_version: CATDESK_VERSION.to_string(),
         frame_ms: MASCOT_FRAME_MS,
         spirit: use_spirit,
         traits: StoredMascotTraits {

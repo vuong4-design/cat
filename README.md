@@ -11,6 +11,18 @@ An open-source tool that turns ChatGPT Web into a coding agent. No reverse engin
 
 This is an independent open-source project and is not affiliated with or endorsed by OpenAI. I built it as a personal tool and decided to open-source it. Some features are still buggy and may cause unexpected behavior. Use it at your own risk. I am not responsible for any loss caused by this tool. It is strongly recommended to run it inside a VM or container.
 
+# Security Model and Limitations
+
+CatDesk gives ChatGPT Web local tools. Treat it like a powerful local automation process, not a sandbox.
+
+- Shell execution is guardrails, not containment. `shell_mode = "allowlist"` is the default, `shell_mode = "disabled"` turns shell execution off, and `shell_mode = "unrestricted"` allows a normal local shell that can access the machine like any other terminal.
+- File tools check that requested paths stay inside the workspace, but unrestricted shell commands are separate from file-tool path checks.
+- Destructive delete operations require a dry-run first. The dry-run returns a short-lived confirmation token that must be supplied in a later delete call.
+- If `.catdesk/current_plan.md` contains `plan_required: true`, mutating tools and shell/Git operations are blocked until a non-empty plan is recorded, unless the caller explicitly passes `allow_without_plan=true`.
+- Verification reports `PASSED`, `FAILED`, `PARTIAL`, or `NOT_CONFIGURED`. A missing or unconfigured check is not treated as a successful verification.
+- Git commit helpers stage only explicitly requested files and refuse commits on `main` or `master` unless `allow_main=true`.
+- Use a VM, container, separate checkout, or reliable backups for risky work. Keep secrets out of the workspace and review diffs before committing.
+
 # Why CatDesk?
 
 Codex has a very generous weekly quota (2x usage + reset usage frequently) compared to Antigravity and Claude Code (3 Opus prompts then 5h quota is gone lol), that's why I love OpenAI so much.

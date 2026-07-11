@@ -1,17 +1,20 @@
 use crate::command;
 use serde::Serialize;
 use serde_json::Value;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_VERIFY_TIMEOUT_MS: u64 = 120_000;
-const MAX_SUMMARY_CHARS: usize = 1_200;
+const MAX_SUMMARY_LINES: usize = 18;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerificationCommand {
     pub ecosystem: String,
     pub command: String,
+    pub executable: String,
+    pub args: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -19,15 +22,18 @@ pub struct VerificationCommand {
 pub struct VerificationResult {
     pub ecosystem: String,
     pub command: String,
+    pub status: String,
     pub success: bool,
+    pub exit_code: Option<i32>,
     pub elapsed_ms: u64,
-    pub summary: String,
+    pub summary: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerifyProjectOutput {
     pub success: bool,
+    pub status: String,
     pub commands: Vec<VerificationResult>,
     pub skipped: Vec<String>,
 }
@@ -35,6 +41,7 @@ pub struct VerifyProjectOutput {
 impl VerifyProjectOutput {
     pub fn render_text(&self) -> String {
         let mut out = String::new();
+        out.push_str(&format!("status: {}\n", self.status));
         out.push_str(&format!("success: {}\n", self.success));
         out.push_str(&format!("commands: {}\n", self.commands.len()));
         if !self.skipped.is_empty() {
@@ -47,13 +54,21 @@ impl VerifyProjectOutput {
         }
         for result in &self.commands {
             out.push_str(&format!(
-                "\n## {} - {}\nstatus: {}\nelapsed_ms: {}\n\n{}\n",
+                "\n## {} - {}\nstatus: {}\nexit_code: {}\nelapsed_ms: {}\n",
                 result.ecosystem,
                 result.command,
-                if result.success { "passed" } else { "failed" },
+                result.status,
+                result
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "none".into()),
                 result.elapsed_ms,
-                result.summary
             ));
+            for line in &result.summary {
+                out.push_str("- ");
+                out.push_str(line);
+                out.push('\n');
+            }
         }
         out
     }
@@ -66,30 +81,120 @@ fn workspace_root_path(workspace_root: &str) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())
 }
 
-fn has_python_files(root: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(root) else {
+fn executable_available(name: &str) -> bool {
+    let path_exts = if cfg!(windows) {
+        env::var_os("PATHEXT")
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![".EXE".into(), ".BAT".into(), ".CMD".into()])
+    } else {
+        Vec::new()
+    };
+    let Some(path) = env::var_os("PATH") else {
         return false;
     };
-    entries.flatten().any(|entry| {
-        entry
-            .path()
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext == "py")
-    })
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return true;
+        }
+        if cfg!(windows) && Path::new(name).extension().is_none() {
+            for ext in &path_exts {
+                if dir.join(format!("{name}{ext}")).is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn has_python_files(root: &Path) -> bool {
+    fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .any(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext == "py")
+        })
+}
+
+fn package_json(root: &Path) -> Option<Value> {
+    let text = fs::read_to_string(root.join("package.json")).ok()?;
+    serde_json::from_str::<Value>(&text).ok()
 }
 
 fn package_script_exists(root: &Path, script: &str) -> bool {
-    let Ok(text) = fs::read_to_string(root.join("package.json")) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
-    value
-        .get("scripts")
-        .and_then(Value::as_object)
+    package_json(root)
+        .and_then(|value| value.get("scripts").cloned())
+        .and_then(|scripts| scripts.as_object().cloned())
         .is_some_and(|scripts| scripts.contains_key(script))
+}
+
+fn node_package_manager(root: &Path) -> Option<(&'static str, &'static str)> {
+    [
+        ("pnpm-lock.yaml", "pnpm"),
+        ("yarn.lock", "yarn"),
+        ("bun.lock", "bun"),
+        ("bun.lockb", "bun"),
+        ("package-lock.json", "npm"),
+    ]
+    .into_iter()
+    .find_map(|(lockfile, manager)| root.join(lockfile).is_file().then_some((lockfile, manager)))
+    .or_else(|| {
+        root.join("package.json")
+            .is_file()
+            .then_some(("package.json", "npm"))
+    })
+}
+
+fn node_script_command(manager: &str, script: &str) -> VerificationCommand {
+    let args = match manager {
+        "npm" => vec!["run".to_string(), script.to_string()],
+        "pnpm" => vec!["run".to_string(), script.to_string()],
+        "yarn" => vec![script.to_string()],
+        "bun" => vec!["run".to_string(), script.to_string()],
+        _ => vec!["run".to_string(), script.to_string()],
+    };
+    let command = format!("{} {}", manager, args.join(" "));
+    VerificationCommand {
+        ecosystem: "Node".into(),
+        command,
+        executable: manager.into(),
+        args,
+    }
+}
+
+fn pyproject_text(root: &Path) -> String {
+    fs::read_to_string(root.join("pyproject.toml")).unwrap_or_default()
+}
+
+fn python_project_detected(root: &Path) -> bool {
+    root.join("pyproject.toml").is_file()
+        || root.join("setup.py").is_file()
+        || root.join("requirements.txt").is_file()
+        || has_python_files(root)
+}
+
+fn pytest_configured(root: &Path) -> bool {
+    root.join("pytest.ini").is_file() || pyproject_text(root).contains("[tool.pytest")
+}
+
+fn ruff_configured(root: &Path) -> bool {
+    root.join("ruff.toml").is_file() || pyproject_text(root).contains("[tool.ruff")
+}
+
+fn mypy_configured(root: &Path) -> bool {
+    root.join("mypy.ini").is_file() || pyproject_text(root).contains("[tool.mypy")
 }
 
 pub fn verification_plan(
@@ -104,14 +209,20 @@ pub fn verification_plan(
             VerificationCommand {
                 ecosystem: "Rust".into(),
                 command: "cargo fmt --check".into(),
+                executable: "cargo".into(),
+                args: vec!["fmt".into(), "--check".into()],
             },
             VerificationCommand {
                 ecosystem: "Rust".into(),
                 command: "cargo test".into(),
+                executable: "cargo".into(),
+                args: vec!["test".into()],
             },
             VerificationCommand {
                 ecosystem: "Rust".into(),
                 command: "cargo build".into(),
+                executable: "cargo".into(),
+                args: vec!["build".into()],
             },
         ]);
     } else {
@@ -119,16 +230,10 @@ pub fn verification_plan(
     }
 
     if root.join("package.json").is_file() {
-        for (script, command) in [
-            ("test", "npm test"),
-            ("build", "npm run build"),
-            ("lint", "npm run lint"),
-        ] {
+        let (_, manager) = node_package_manager(&root).expect("package.json selects npm fallback");
+        for script in ["test", "build", "lint"] {
             if package_script_exists(&root, script) {
-                commands.push(VerificationCommand {
-                    ecosystem: "Node".into(),
-                    command: command.into(),
-                });
+                commands.push(node_script_command(manager, script));
             } else {
                 skipped.push(format!("Node: package.json has no `{script}` script"));
             }
@@ -137,25 +242,37 @@ pub fn verification_plan(
         skipped.push("Node: package.json not found".into());
     }
 
-    if root.join("pyproject.toml").is_file()
-        || root.join("setup.py").is_file()
-        || root.join("requirements.txt").is_file()
-        || has_python_files(&root)
-    {
-        commands.extend([
-            VerificationCommand {
+    if python_project_detected(&root) {
+        if pytest_configured(&root) {
+            commands.push(VerificationCommand {
                 ecosystem: "Python".into(),
                 command: "pytest".into(),
-            },
-            VerificationCommand {
+                executable: "pytest".into(),
+                args: Vec::new(),
+            });
+        } else {
+            skipped.push("Python: pytest not configured".into());
+        }
+        if ruff_configured(&root) {
+            commands.push(VerificationCommand {
                 ecosystem: "Python".into(),
                 command: "ruff check .".into(),
-            },
-            VerificationCommand {
+                executable: "ruff".into(),
+                args: vec!["check".into(), ".".into()],
+            });
+        } else {
+            skipped.push("Python: ruff not configured".into());
+        }
+        if mypy_configured(&root) {
+            commands.push(VerificationCommand {
                 ecosystem: "Python".into(),
                 command: "mypy .".into(),
-            },
-        ]);
+                executable: "mypy".into(),
+                args: vec![".".into()],
+            });
+        } else {
+            skipped.push("Python: mypy not configured".into());
+        }
     } else {
         skipped.push("Python: no Python project files found".into());
     }
@@ -163,52 +280,91 @@ pub fn verification_plan(
     Ok((commands, skipped))
 }
 
-fn summarize_output(stdout: &str, stderr: &str) -> String {
-    let mut combined = String::new();
-    if !stdout.trim().is_empty() {
-        combined.push_str("stdout:\n");
-        combined.push_str(stdout.trim());
-    }
-    if !stderr.trim().is_empty() {
-        if !combined.is_empty() {
-            combined.push_str("\n\n");
+fn summary_lines(result: &command::CommandResult) -> Vec<String> {
+    let summary = command::summarize_result(result);
+    let mut lines = Vec::new();
+    lines.extend(summary.errors);
+    for line in summary.key_output {
+        if !lines.contains(&line) {
+            lines.push(line);
         }
-        combined.push_str("stderr:\n");
-        combined.push_str(stderr.trim());
     }
-    if combined.is_empty() {
-        combined.push_str("(no output)");
+    if lines.is_empty() {
+        lines.push("(no output)".into());
     }
-    if combined.chars().count() <= MAX_SUMMARY_CHARS {
-        return combined;
-    }
-    let mut out = combined
-        .chars()
-        .take(MAX_SUMMARY_CHARS.saturating_sub(32))
-        .collect::<String>();
-    out.push_str("\n[output truncated]");
-    out
+    lines.truncate(MAX_SUMMARY_LINES);
+    lines
 }
 
 pub async fn verify_project(workspace_root: &str) -> Result<VerifyProjectOutput, String> {
+    verify_project_with_timeout(workspace_root, DEFAULT_VERIFY_TIMEOUT_MS).await
+}
+
+pub async fn verify_project_with_timeout(
+    workspace_root: &str,
+    timeout_ms: u64,
+) -> Result<VerifyProjectOutput, String> {
     let root = workspace_root_path(workspace_root)?;
     let (commands, skipped) = verification_plan(workspace_root)?;
     let mut results = Vec::new();
 
     for command_to_run in commands {
+        if !executable_available(&command_to_run.executable) {
+            results.push(VerificationResult {
+                ecosystem: command_to_run.ecosystem,
+                command: command_to_run.command,
+                status: "SKIPPED_MISSING_TOOL".into(),
+                success: false,
+                exit_code: None,
+                elapsed_ms: 0,
+                summary: vec![format!("missing executable: {}", command_to_run.executable)],
+            });
+            continue;
+        }
+        let args = command_to_run
+            .args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let result =
-            command::run_command(&command_to_run.command, &root, DEFAULT_VERIFY_TIMEOUT_MS).await;
+            command::run_program(&command_to_run.executable, &args, &root, timeout_ms).await;
+        let status = if result.success {
+            "PASSED"
+        } else if result.exit_code.is_none() && result.stderr.starts_with("Command timed out") {
+            "TIMED_OUT"
+        } else {
+            "FAILED"
+        };
         results.push(VerificationResult {
             ecosystem: command_to_run.ecosystem,
             command: command_to_run.command,
+            status: status.into(),
             success: result.success,
+            exit_code: result.exit_code,
             elapsed_ms: result.elapsed_ms,
-            summary: summarize_output(&result.stdout, &result.stderr),
+            summary: summary_lines(&result),
         });
     }
 
+    let status = if results.is_empty() {
+        "NOT_CONFIGURED"
+    } else if results
+        .iter()
+        .any(|result| result.status == "FAILED" || result.status == "TIMED_OUT")
+    {
+        "FAILED"
+    } else if results
+        .iter()
+        .any(|result| result.status == "SKIPPED_MISSING_TOOL")
+    {
+        "PARTIAL"
+    } else {
+        "PASSED"
+    };
+
     Ok(VerifyProjectOutput {
-        success: results.iter().all(|result| result.success),
+        success: status == "PASSED",
+        status: status.into(),
         commands: results,
         skipped,
     })
@@ -224,11 +380,12 @@ mod tests {
     }
 
     #[test]
-    fn verification_plan_detects_rust_node_and_python_commands() {
+    fn verification_plan_detects_rust_node_and_configured_python_commands() {
         let workspace = test_workspace("plan");
         fs::create_dir_all(&workspace).expect("create workspace");
         fs::write(workspace.join("Cargo.toml"), "[package]\nname = \"demo\"\n")
             .expect("write cargo");
+        fs::write(workspace.join("pnpm-lock.yaml"), "").expect("write pnpm lock");
         fs::write(
             workspace.join("package.json"),
             r#"{"scripts":{"test":"echo test","build":"echo build"}}"#,
@@ -236,7 +393,7 @@ mod tests {
         .expect("write package");
         fs::write(
             workspace.join("pyproject.toml"),
-            "[project]\nname = \"demo\"\n",
+            "[project]\nname = \"demo\"\n[tool.pytest.ini_options]\n[tool.ruff]\n",
         )
         .expect("write pyproject");
 
@@ -249,20 +406,50 @@ mod tests {
         assert!(command_names.contains(&"cargo fmt --check"));
         assert!(command_names.contains(&"cargo test"));
         assert!(command_names.contains(&"cargo build"));
-        assert!(command_names.contains(&"npm test"));
-        assert!(command_names.contains(&"npm run build"));
+        assert!(command_names.contains(&"pnpm run test"));
+        assert!(command_names.contains(&"pnpm run build"));
         assert!(command_names.contains(&"pytest"));
         assert!(command_names.contains(&"ruff check ."));
-        assert!(command_names.contains(&"mypy ."));
+        assert!(!command_names.contains(&"mypy ."));
         assert!(skipped.iter().any(|item| item.contains("lint")));
+        assert!(skipped.iter().any(|item| item.contains("mypy")));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn verify_project_reports_not_configured_for_empty_workspace() {
+        let workspace = test_workspace("empty");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let output = verify_project(&workspace.to_string_lossy())
+            .await
+            .expect("verify empty");
+
+        assert_eq!(output.status, "NOT_CONFIGURED");
+        assert!(!output.success);
+        assert!(output.commands.is_empty());
 
         let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
-    fn summarize_output_truncates_long_output() {
-        let summary = summarize_output(&"a".repeat(MAX_SUMMARY_CHARS + 100), "");
-        assert!(summary.contains("[output truncated]"));
-        assert!(summary.len() < MAX_SUMMARY_CHARS + 64);
+    fn summary_lines_captures_error_near_end() {
+        let mut stdout = String::new();
+        for i in 0..100 {
+            stdout.push_str(&format!("line {i}\n"));
+        }
+        stdout.push_str("test result: FAILED near end\n");
+        let result = command::CommandResult {
+            stdout,
+            stderr: String::new(),
+            success: false,
+            exit_code: Some(1),
+            elapsed_ms: 1,
+        };
+
+        let lines = summary_lines(&result);
+
+        assert!(lines.iter().any(|line| line.contains("FAILED near end")));
     }
 }

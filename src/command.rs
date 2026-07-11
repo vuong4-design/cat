@@ -93,14 +93,7 @@ pub fn resolve_workspace_path(
         root.join(input)
     };
 
-    let candidate = normalize_windows_verbatim_path(candidate.canonicalize().unwrap_or(candidate));
-    if !candidate.starts_with(&root) {
-        return Err(format!(
-            "Path escapes workspace root: {}",
-            candidate.display()
-        ));
-    }
-    Ok(candidate)
+    resolve_candidate_inside_root(&root, candidate)
 }
 
 /// Resolve `input` relative to `cwd`, rejecting path traversal outside the workspace root.
@@ -121,11 +114,43 @@ pub fn resolve_command_path(
         cwd.join(input)
     };
 
-    let candidate = normalize_windows_verbatim_path(candidate.canonicalize().unwrap_or(candidate));
-    if !candidate.starts_with(&root) {
+    resolve_candidate_inside_root(&root, candidate)
+}
+
+fn resolve_candidate_inside_root(root: &Path, candidate: PathBuf) -> Result<PathBuf, String> {
+    let candidate = normalize_windows_verbatim_path(candidate);
+    if let Ok(canonical) = candidate.canonicalize() {
+        let canonical = normalize_windows_verbatim_path(canonical);
+        if !canonical.starts_with(root) {
+            return Err(format!(
+                "Path escapes workspace root: {}",
+                canonical.display()
+            ));
+        }
+        return Ok(canonical);
+    }
+
+    let mut existing = candidate.as_path();
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or_else(|| format!("Path has no existing parent: {}", candidate.display()))?;
+    }
+    let existing_canonical = normalize_windows_verbatim_path(
+        existing
+            .canonicalize()
+            .map_err(|e| format!("Failed to canonicalize existing parent: {e}"))?,
+    );
+    if !existing_canonical.starts_with(root) {
         return Err(format!(
-            "Path escapes workspace root: {}",
-            candidate.display()
+            "Path escapes workspace root through existing parent: {}",
+            existing_canonical.display()
+        ));
+    }
+    if existing != candidate && !existing_canonical.is_dir() {
+        return Err(format!(
+            "Path parent is not a directory: {}",
+            existing_canonical.display()
         ));
     }
     Ok(candidate)
@@ -257,14 +282,8 @@ pub async fn run_command(command: &str, cwd: &Path, timeout_ms: u64) -> CommandR
     match timeout(Duration::from_millis(timeout_ms), fut).await {
         Ok(Ok(output)) => {
             let elapsed_ms = start.elapsed().as_millis() as u64;
-            let stdout = String::from_utf8_lossy(
-                &output.stdout[..output.stdout.len().min(MAX_BUFFER_BYTES)],
-            )
-            .to_string();
-            let stderr = String::from_utf8_lossy(
-                &output.stderr[..output.stderr.len().min(MAX_BUFFER_BYTES)],
-            )
-            .to_string();
+            let stdout = bounded_output_text(&output.stdout);
+            let stderr = bounded_output_text(&output.stderr);
             CommandResult {
                 stdout,
                 stderr,
@@ -288,6 +307,57 @@ pub async fn run_command(command: &str, cwd: &Path, timeout_ms: u64) -> CommandR
             elapsed_ms: start.elapsed().as_millis() as u64,
         },
     }
+}
+
+pub async fn run_program(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout_ms: u64,
+) -> CommandResult {
+    let start = Instant::now();
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd);
+    match timeout(Duration::from_millis(timeout_ms), command.output()).await {
+        Ok(Ok(output)) => {
+            let stdout = bounded_output_text(&output.stdout);
+            let stderr = bounded_output_text(&output.stderr);
+            CommandResult {
+                stdout,
+                stderr,
+                success: output.status.success(),
+                exit_code: output.status.code(),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            }
+        }
+        Ok(Err(e)) => CommandResult {
+            stdout: String::new(),
+            stderr: format!("Failed to execute: {e}"),
+            success: false,
+            exit_code: None,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        },
+        Err(_) => CommandResult {
+            stdout: String::new(),
+            stderr: format!("Command timed out after {timeout_ms} ms"),
+            success: false,
+            exit_code: None,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        },
+    }
+}
+
+fn bounded_output_text(bytes: &[u8]) -> String {
+    if bytes.len() <= MAX_BUFFER_BYTES {
+        return String::from_utf8_lossy(bytes).to_string();
+    }
+    let half = MAX_BUFFER_BYTES / 2;
+    let mut out = String::from_utf8_lossy(&bytes[..half]).to_string();
+    out.push_str("\n[... middle output omitted by CatDesk capture limit ...]\n");
+    out.push_str(&String::from_utf8_lossy(
+        &bytes[bytes.len().saturating_sub(half)..],
+    ));
+    out
 }
 
 #[cfg(windows)]
@@ -350,7 +420,10 @@ pub fn summarize_result(result: &CommandResult) -> CommandSummary {
 }
 
 fn summarize_errors(result: &CommandResult) -> Vec<String> {
-    let mut errors = summarize_lines(&result.stderr, 8);
+    let mut errors = signal_lines(&result.stderr, 8);
+    if errors.is_empty() {
+        errors = head_tail_lines(&result.stderr, 4, 4);
+    }
     if errors.is_empty() && !result.success {
         errors.push(match result.exit_code {
             Some(code) => format!("Command failed with exit code {code}"),
@@ -368,13 +441,8 @@ fn summarize_key_output(result: &CommandResult) -> Vec<String> {
     } else {
         format!("{}\n{}", result.stdout, result.stderr)
     };
-    let all_lines = summarize_lines(&combined, 16);
-    let mut selected = all_lines
-        .iter()
-        .filter(|line| is_signal_output_line(line))
-        .take(8)
-        .cloned()
-        .collect::<Vec<_>>();
+    let all_lines = head_tail_lines(&combined, 8, 8);
+    let mut selected = signal_lines(&combined, 8);
     if selected.len() < 8 {
         for line in all_lines.iter().rev() {
             if !selected.contains(line) {
@@ -389,13 +457,30 @@ fn summarize_key_output(result: &CommandResult) -> Vec<String> {
     selected
 }
 
-fn summarize_lines(text: &str, max_lines: usize) -> Vec<String> {
+fn signal_lines(text: &str, max_lines: usize) -> Vec<String> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .filter(|line| is_signal_output_line(line))
         .take(max_lines)
         .map(truncate_summary_line)
         .collect()
+}
+
+fn head_tail_lines(text: &str, head: usize, tail: usize) -> Vec<String> {
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(truncate_summary_line)
+        .collect::<Vec<_>>();
+    if lines.len() <= head + tail {
+        return lines;
+    }
+    let mut out = lines.iter().take(head).cloned().collect::<Vec<_>>();
+    out.push("[... output truncated ...]".into());
+    out.extend(lines.iter().skip(lines.len().saturating_sub(tail)).cloned());
+    out
 }
 
 fn truncate_summary_line(line: &str) -> String {

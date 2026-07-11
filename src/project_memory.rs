@@ -2,6 +2,8 @@ use crate::command;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MEMORY_DIR: &str = ".catdesk";
 const DEFAULT_SECTION: &str = "_default";
@@ -31,7 +33,7 @@ const MEMORY_DOCUMENTS: [MemoryDocumentDef; 4] = [
         name: "todo",
         file_name: "todo.md",
         title: "Todo",
-        body: "- [ ] Capture project follow-up work here.\n",
+        body: "Use task_queue_add to record follow-up work.\n",
     },
     MemoryDocumentDef {
         name: "session",
@@ -101,6 +103,7 @@ pub struct SessionResumeOutput {
     pub verification_results: String,
     pub remaining_work: String,
     pub resume_prompt: String,
+    pub timestamp: String,
 }
 
 impl SessionResumeOutput {
@@ -176,6 +179,20 @@ fn read_document(root: &Path, def: MemoryDocumentDef) -> Result<MemoryDocument, 
     })
 }
 
+fn read_document_or_default(root: &Path, def: MemoryDocumentDef) -> Result<MemoryDocument, String> {
+    let path = memory_root(root).join(def.file_name);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_document_text(def),
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(MemoryDocument {
+        name: def.name.to_string(),
+        path: to_workspace_relative(root, &path),
+        text,
+    })
+}
+
 fn normalize_markdown(content: &str) -> String {
     let mut text = content.replace("\r\n", "\n").replace('\r', "\n");
     if !text.ends_with('\n') {
@@ -233,20 +250,79 @@ fn session_resume_text(
     verification_results: &str,
     remaining_work: &str,
     resume_prompt: &str,
+    timestamp: &str,
+    system_facts: &str,
+    user_notes: &str,
 ) -> String {
     format!(
         "# Session\n\n\
+## System-derived facts\n\n{}\
+\n## Model-authored summary\n\n\
+timestamp: {timestamp}\n\n\
 ## Session goal\n\n{}\
 \n## Files changed\n\n{}\
 \n## Verification results\n\n{}\
 \n## Remaining work\n\n{}\
-\n## Resume prompt\n\n{}",
+\n## Resume prompt\n\n{}\
+\n## User notes\n\n{}",
+        markdown_block(system_facts),
         markdown_block(session_goal),
         markdown_list(files_changed),
         markdown_block(verification_results),
         markdown_block(remaining_work),
         markdown_block(resume_prompt),
+        markdown_block(user_notes),
     )
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn session_system_facts(root: &Path) -> String {
+    let branch =
+        git_output(root, &["branch", "--show-current"]).unwrap_or_else(|| "unknown".into());
+    let head =
+        git_output(root, &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let git_status = git_output(root, &["status", "--porcelain"])
+        .map(|text| {
+            text.lines()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "- None reported by git status.".into());
+    format!(
+        "- Generated at: {}\n- Git branch: {branch}\n- Git HEAD: {head}\n- Git status:\n{git_status}\n",
+        OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "unknown".into())
+    )
+}
+
+fn existing_user_notes(text: &str) -> String {
+    let Some(start) = text.find("\n## User notes") else {
+        return "_None recorded._\n".into();
+    };
+    let after_heading = &text[start + "\n## User notes".len()..];
+    let after_heading = after_heading.trim_start_matches(['\r', '\n']);
+    let end = after_heading.find("\n## ").unwrap_or(after_heading.len());
+    let notes = after_heading[..end].trim();
+    if notes.is_empty() {
+        "_None recorded._\n".into()
+    } else {
+        normalize_markdown(notes)
+    }
 }
 
 pub fn init(workspace_root: &str) -> Result<ProjectMemoryOutput, String> {
@@ -257,7 +333,6 @@ pub fn init(workspace_root: &str) -> Result<ProjectMemoryOutput, String> {
 
 pub fn read(workspace_root: &str, document: Option<&str>) -> Result<ProjectMemoryOutput, String> {
     let root = workspace_root_path(workspace_root)?;
-    ensure_memory_files(&root)?;
     if let Some(document) = document.filter(|value| !value.trim().is_empty()) {
         let def = document_def(document.trim()).ok_or_else(|| {
             format!(
@@ -266,16 +341,27 @@ pub fn read(workspace_root: &str, document: Option<&str>) -> Result<ProjectMemor
         })?;
         return Ok(ProjectMemoryOutput {
             root: to_workspace_relative(&root, &memory_root(&root)),
-            documents: vec![read_document(&root, def)?],
+            documents: vec![read_document_or_default(&root, def)?],
         });
     }
-    read_all_from_root(&root)
+    read_all_from_root_without_init(&root)
 }
 
 fn read_all_from_root(root: &Path) -> Result<ProjectMemoryOutput, String> {
     let mut documents = Vec::new();
     for def in MEMORY_DOCUMENTS {
         documents.push(read_document(root, def)?);
+    }
+    Ok(ProjectMemoryOutput {
+        root: to_workspace_relative(root, &memory_root(root)),
+        documents,
+    })
+}
+
+fn read_all_from_root_without_init(root: &Path) -> Result<ProjectMemoryOutput, String> {
+    let mut documents = Vec::new();
+    for def in MEMORY_DOCUMENTS {
+        documents.push(read_document_or_default(root, def)?);
     }
     Ok(ProjectMemoryOutput {
         root: to_workspace_relative(root, &memory_root(root)),
@@ -327,12 +413,22 @@ pub fn update_session_resume(
     ensure_memory_files(&root)?;
     let def = document_def("session").expect("session memory document exists");
     let path = memory_root(&root).join(def.file_name);
+    let timestamp = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".into());
+    let system_facts = session_system_facts(&root);
+    let user_notes = fs::read_to_string(&path)
+        .map(|text| existing_user_notes(&text))
+        .unwrap_or_else(|_| "_None recorded._\n".into());
     let content = session_resume_text(
         session_goal,
         &files_changed,
         verification_results,
         remaining_work,
         resume_prompt,
+        &timestamp,
+        &system_facts,
+        &user_notes,
     );
     fs::write(&path, content).map_err(|e| e.to_string())?;
     Ok(SessionResumeOutput {
@@ -342,6 +438,7 @@ pub fn update_session_resume(
         verification_results: verification_results.trim().to_string(),
         remaining_work: remaining_work.trim().to_string(),
         resume_prompt: resume_prompt.trim().to_string(),
+        timestamp,
     })
 }
 
@@ -416,15 +513,59 @@ mod tests {
             .expect("read session memory");
         for heading in [
             "## Session goal",
+            "## System-derived facts",
+            "## Model-authored summary",
             "## Files changed",
             "## Verification results",
             "## Remaining work",
             "## Resume prompt",
+            "## User notes",
         ] {
             assert!(text.contains(heading), "missing heading {heading}");
         }
+        assert!(text.contains("timestamp:"));
         assert!(text.contains("- src/project_memory.rs"));
         assert!(text.contains("Continue with Task 7"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn update_session_resume_preserves_user_notes() {
+        let workspace = test_workspace("session-user-notes");
+        fs::create_dir_all(workspace.join(MEMORY_DIR)).expect("create memory");
+        fs::write(
+            workspace.join(MEMORY_DIR).join("session.md"),
+            "# Session\n\n## User notes\n\nKeep this user-authored note.\n",
+        )
+        .expect("write session");
+
+        update_session_resume(
+            &workspace.to_string_lossy(),
+            "Goal",
+            vec![],
+            "Not run",
+            "None",
+            "Continue",
+        )
+        .expect("update session resume");
+
+        let text = fs::read_to_string(workspace.join(MEMORY_DIR).join("session.md"))
+            .expect("read session memory");
+        assert!(text.contains("Keep this user-authored note."));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn read_does_not_initialize_memory_files() {
+        let workspace = test_workspace("read-no-init");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let output = read(&workspace.to_string_lossy(), None).expect("read memory");
+
+        assert_eq!(output.documents.len(), 4);
+        assert!(!workspace.join(MEMORY_DIR).exists());
 
         let _ = fs::remove_dir_all(workspace);
     }

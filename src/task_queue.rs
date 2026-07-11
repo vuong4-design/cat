@@ -1,21 +1,24 @@
 use crate::command;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const CATDESK_DIR: &str = ".catdesk";
 const TODO_FILE: &str = "todo.md";
-const DEFAULT_TODO_TEXT: &str = "# Todo\n\n- [ ] Capture project follow-up work here.\n";
+const NEXT_TASK_ID_MARKER_PREFIX: &str = "<!-- catdesk-next-task-id: ";
+const DEFAULT_TODO_TEXT: &str =
+    "# Todo\n\n<!-- catdesk-next-task-id: 1 -->\n\nUse task_queue_add to record follow-up work.\n";
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskItem {
-    pub index: usize,
+    pub id: String,
     pub done: bool,
     pub text: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskQueueOutput {
     pub path: String,
@@ -38,7 +41,7 @@ impl TaskQueueOutput {
             out.push_str("\n## Tasks\n");
             for task in &self.tasks {
                 let marker = if task.done { "x" } else { " " };
-                out.push_str(&format!("{}. [{}] {}\n", task.index, marker, task.text));
+                out.push_str(&format!("- [{}] {} {}\n", marker, task.id, task.text));
             }
         }
         out
@@ -96,57 +99,137 @@ fn ensure_todo_file(root: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn parse_checkbox_line(line: &str) -> Option<(bool, String)> {
+fn parse_checkbox_line(line: &str) -> Option<(bool, &str)> {
     let trimmed = line.trim_start();
     for prefix in ["- [ ] ", "* [ ] ", "- [x] ", "- [X] ", "* [x] ", "* [X] "] {
         if let Some(task) = trimmed.strip_prefix(prefix) {
-            return Some((
-                prefix.contains('x') || prefix.contains('X'),
-                task.to_string(),
-            ));
+            return Some((prefix.contains('x') || prefix.contains('X'), task));
         }
     }
     None
 }
 
-fn parse_tasks(text: &str) -> Vec<TaskItem> {
-    let mut tasks = Vec::new();
-    for line in text.lines() {
-        if let Some((done, task_text)) = parse_checkbox_line(line) {
-            tasks.push(TaskItem {
-                index: tasks.len() + 1,
-                done,
-                text: task_text,
-            });
-        }
+fn parse_task_payload(payload: &str) -> Option<(String, String)> {
+    let mut parts = payload.trim().splitn(2, char::is_whitespace);
+    let id = parts.next()?.trim();
+    if !valid_task_id(id) {
+        return None;
     }
-    tasks
+    let text = parts.next().unwrap_or("").trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some((id.to_string(), text.to_string()))
 }
 
-fn output_from_text(root: &Path, path: &Path, text: String) -> TaskQueueOutput {
-    let tasks = parse_tasks(&text);
+fn valid_task_id(id: &str) -> bool {
+    let Some(number) = id.strip_prefix("T-") else {
+        return false;
+    };
+    number.len() == 4 && number.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn parse_tasks(text: &str) -> Result<Vec<TaskItem>, String> {
+    let mut tasks = Vec::new();
+    let mut seen = HashSet::new();
+    for line in text.lines() {
+        let Some((done, payload)) = parse_checkbox_line(line) else {
+            continue;
+        };
+        let Some((id, task_text)) = parse_task_payload(payload) else {
+            continue;
+        };
+        if !seen.insert(id.clone()) {
+            return Err(format!("Duplicate task ID found in .catdesk/todo.md: {id}"));
+        }
+        tasks.push(TaskItem {
+            id,
+            done,
+            text: task_text,
+        });
+    }
+    Ok(tasks)
+}
+
+fn output_from_text(root: &Path, path: &Path, text: String) -> Result<TaskQueueOutput, String> {
+    let tasks = parse_tasks(&text)?;
     let done = tasks.iter().filter(|task| task.done).count();
-    TaskQueueOutput {
+    Ok(TaskQueueOutput {
         path: to_workspace_relative(root, path),
         total: tasks.len(),
         open: tasks.len().saturating_sub(done),
         done,
         tasks,
         text,
+    })
+}
+
+fn max_task_number(tasks: &[TaskItem]) -> u32 {
+    tasks
+        .iter()
+        .filter_map(|task| task.id.strip_prefix("T-"))
+        .filter_map(|number| number.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0)
+}
+
+fn next_task_number_from_marker(text: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        let marker = line.trim().strip_prefix(NEXT_TASK_ID_MARKER_PREFIX)?;
+        marker.strip_suffix("-->")?.trim().parse::<u32>().ok()
+    })
+}
+
+fn next_task_id(tasks: &[TaskItem], text: &str) -> String {
+    let marker_next = next_task_number_from_marker(text).unwrap_or(1);
+    let next = marker_next.max(max_task_number(tasks).saturating_add(1));
+    format!("T-{next:04}")
+}
+
+fn set_next_task_marker(text: &str, next_number: u32) -> String {
+    let marker = format!("{NEXT_TASK_ID_MARKER_PREFIX}{next_number} -->");
+    let mut found = false;
+    let mut next = String::new();
+    for line in normalize_markdown(text).lines() {
+        if line.trim().starts_with(NEXT_TASK_ID_MARKER_PREFIX) {
+            next.push_str(&marker);
+            found = true;
+        } else {
+            next.push_str(line);
+        }
+        next.push('\n');
+    }
+    if !found {
+        let mut text = normalize_markdown(&next);
+        if !text.ends_with("\n\n") {
+            text.push('\n');
+        }
+        text.push_str(&marker);
+        text.push_str("\n\n");
+        text
+    } else {
+        next
     }
 }
 
 pub fn read(workspace_root: &str) -> Result<TaskQueueOutput, String> {
     let root = workspace_root_path(workspace_root)?;
-    let path = ensure_todo_file(&root)?;
-    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    Ok(output_from_text(&root, &path, text))
+    let path = todo_path(&root);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_TODO_TEXT.to_string(),
+        Err(e) => return Err(e.to_string()),
+    };
+    output_from_text(&root, &path, text)
 }
 
 pub fn add(workspace_root: &str, tasks: &[String]) -> Result<TaskQueueOutput, String> {
     let root = workspace_root_path(workspace_root)?;
     let path = ensure_todo_file(&root)?;
-    let mut text = normalize_markdown(&fs::read_to_string(&path).map_err(|e| e.to_string())?);
+    let existing = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let marker_next = next_task_number_from_marker(&existing).unwrap_or(1);
+    let mut text = set_next_task_marker(&existing, marker_next);
+    let mut parsed = parse_tasks(&text)?;
     if !text.ends_with("\n\n") {
         text.push('\n');
     }
@@ -155,49 +238,63 @@ pub fn add(workspace_root: &str, tasks: &[String]) -> Result<TaskQueueOutput, St
         .map(|task| task.trim())
         .filter(|task| !task.is_empty())
     {
+        let id = next_task_id(&parsed, &text);
         text.push_str("- [ ] ");
+        text.push_str(&id);
+        text.push(' ');
         text.push_str(task);
         text.push('\n');
+        parsed.push(TaskItem {
+            id,
+            done: false,
+            text: task.to_string(),
+        });
+        text = set_next_task_marker(&text, max_task_number(&parsed).saturating_add(1));
     }
     fs::write(&path, &text).map_err(|e| e.to_string())?;
-    Ok(output_from_text(&root, &path, text))
+    output_from_text(&root, &path, text)
 }
 
-pub fn set_status(
-    workspace_root: &str,
-    index: usize,
-    done: bool,
-) -> Result<TaskQueueOutput, String> {
-    if index == 0 {
-        return Err("index must be 1 or greater".into());
+pub fn set_status(workspace_root: &str, id: &str, done: bool) -> Result<TaskQueueOutput, String> {
+    let id = id.trim();
+    if !valid_task_id(id) {
+        return Err("task id must use the form T-0001".into());
     }
     let root = workspace_root_path(workspace_root)?;
     let path = ensure_todo_file(&root)?;
     let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let mut seen = 0usize;
     let mut updated = false;
+    let mut seen = HashSet::new();
     let mut next = String::new();
     for line in text.lines() {
-        if let Some((_, task_text)) = parse_checkbox_line(line) {
-            seen += 1;
-            if seen == index {
-                let indent_len = line.len().saturating_sub(line.trim_start().len());
-                next.push_str(&line[..indent_len]);
-                next.push_str(if done { "- [x] " } else { "- [ ] " });
-                next.push_str(&task_text);
-                next.push('\n');
-                updated = true;
-                continue;
+        if let Some((_, payload)) = parse_checkbox_line(line) {
+            if let Some((task_id, task_text)) = parse_task_payload(payload) {
+                if !seen.insert(task_id.clone()) {
+                    return Err(format!(
+                        "Duplicate task ID found in .catdesk/todo.md: {task_id}"
+                    ));
+                }
+                if task_id == id {
+                    let indent_len = line.len().saturating_sub(line.trim_start().len());
+                    next.push_str(&line[..indent_len]);
+                    next.push_str(if done { "- [x] " } else { "- [ ] " });
+                    next.push_str(&task_id);
+                    next.push(' ');
+                    next.push_str(&task_text);
+                    next.push('\n');
+                    updated = true;
+                    continue;
+                }
             }
         }
         next.push_str(line);
         next.push('\n');
     }
     if !updated {
-        return Err(format!("No task found at index {index}"));
+        return Err(format!("No task found with id {id}"));
     }
     fs::write(&path, &next).map_err(|e| e.to_string())?;
-    Ok(output_from_text(&root, &path, next))
+    output_from_text(&root, &path, next)
 }
 
 #[cfg(test)]
@@ -210,7 +307,20 @@ mod tests {
     }
 
     #[test]
-    fn add_and_complete_tasks_in_markdown_todo() {
+    fn read_does_not_initialize_todo_file() {
+        let workspace = test_workspace("read-no-init");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let output = read(&workspace.to_string_lossy()).expect("read tasks");
+
+        assert_eq!(output.total, 0);
+        assert!(!workspace.join(CATDESK_DIR).exists());
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn add_and_complete_tasks_by_stable_id() {
         let workspace = test_workspace("todo");
         fs::create_dir_all(&workspace).expect("create workspace");
 
@@ -222,12 +332,51 @@ mod tests {
             ],
         )
         .expect("add tasks");
-        assert_eq!(added.open, 3);
-        assert!(added.text.contains("- [ ] Write task queue tests"));
+        assert_eq!(added.open, 2);
+        assert!(added.text.contains("- [ ] T-0001 Write task queue tests"));
 
-        let completed = set_status(&workspace.to_string_lossy(), 2, true).expect("complete task");
+        let completed =
+            set_status(&workspace.to_string_lossy(), "T-0001", true).expect("complete task");
         assert_eq!(completed.done, 1);
-        assert!(completed.text.contains("- [x] Write task queue tests"));
+        assert!(
+            completed
+                .text
+                .contains("- [x] T-0001 Write task queue tests")
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn add_uses_monotonic_task_marker_after_manual_deletion() {
+        let workspace = test_workspace("monotonic");
+        fs::create_dir_all(workspace.join(CATDESK_DIR)).expect("create memory dir");
+        fs::write(
+            workspace.join(CATDESK_DIR).join(TODO_FILE),
+            "# Todo\n\n<!-- catdesk-next-task-id: 3 -->\n\n- [ ] T-0001 Remaining\n",
+        )
+        .expect("write todo");
+
+        let added =
+            add(&workspace.to_string_lossy(), &["Next task".to_string()]).expect("add task");
+        assert!(added.text.contains("- [ ] T-0003 Next task"));
+        assert!(added.text.contains("catdesk-next-task-id: 4"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn duplicate_task_ids_are_rejected() {
+        let workspace = test_workspace("duplicate");
+        fs::create_dir_all(workspace.join(CATDESK_DIR)).expect("create memory dir");
+        fs::write(
+            workspace.join(CATDESK_DIR).join(TODO_FILE),
+            "# Todo\n\n- [ ] T-0001 First\n- [ ] T-0001 Second\n",
+        )
+        .expect("write todo");
+
+        let error = read(&workspace.to_string_lossy()).expect_err("duplicate ID should fail");
+        assert!(error.contains("Duplicate task ID"));
 
         let _ = fs::remove_dir_all(workspace);
     }

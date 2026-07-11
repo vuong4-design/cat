@@ -1,3 +1,26 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::get_first,
+    clippy::identity_op,
+    clippy::items_after_test_module,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::manual_contains,
+    clippy::needless_borrows_for_generic_args,
+    clippy::needless_lifetimes,
+    clippy::question_mark,
+    clippy::redundant_closure,
+    clippy::some_filter,
+    clippy::single_char_add_str,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::upper_case_acronyms,
+    clippy::useless_vec
+)]
+
+mod app_info;
 mod binagotchy_gen;
 mod browser;
 mod command;

@@ -2,6 +2,7 @@ use crate::command;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 const CATDESK_DIR: &str = ".catdesk";
 const PROMPTS_DIR: &str = "prompts";
@@ -13,20 +14,35 @@ struct DefaultTemplate {
     body: &'static str,
 }
 
-const DEFAULT_TEMPLATES: [DefaultTemplate; 3] = [
+const DEFAULT_TEMPLATES: [DefaultTemplate; 6] = [
     DefaultTemplate {
-        name: "implementation-plan.md",
-        title: "Implementation Plan",
-        body: "Goal:\n\nContext:\n\nConstraints:\n\nPlan:\n1. Inspect the relevant files.\n2. Make the smallest useful change.\n3. Run focused verification.\n4. Report results and remaining risk.\n",
+        name: "start_session.md",
+        title: "Start Session",
+        body: "Goal:\n\nProject context to read first:\n\nConstraints:\n\nDefinition of done:\n",
     },
     DefaultTemplate {
-        name: "code-review.md",
+        name: "plan_first.md",
+        title: "Plan First",
+        body: "Goal:\n\nRelevant files:\n\nRisks:\n\nPlan:\n1. Inspect context.\n2. Identify the smallest safe change.\n3. Implement.\n4. Verify.\n",
+    },
+    DefaultTemplate {
+        name: "security_review.md",
+        title: "Security Review",
+        body: "Review scope:\n\nPrioritize:\n- Data loss risks\n- Path traversal\n- Shell execution risks\n- Secret exposure\n- Permission boundary mistakes\n",
+    },
+    DefaultTemplate {
+        name: "code_review.md",
         title: "Code Review",
         body: "Review focus:\n\nPrioritize:\n- Bugs and regressions\n- Missing tests\n- Safety or data-loss risks\n- Unclear user-facing behavior\n",
     },
     DefaultTemplate {
-        name: "session-handoff.md",
-        title: "Session Handoff",
+        name: "verify_changes.md",
+        title: "Verify Changes",
+        body: "Changed files:\n\nExpected behavior:\n\nVerification commands:\n\nKnown residual risk:\n",
+    },
+    DefaultTemplate {
+        name: "end_session.md",
+        title: "End Session",
         body: "Session goal:\n\nFiles changed:\n\nVerification:\n\nRemaining work:\n\nResume prompt:\n",
     },
 ];
@@ -37,6 +53,8 @@ pub struct PromptTemplate {
     pub name: String,
     pub path: String,
     pub bytes: usize,
+    pub description: String,
+    pub modified_time: Option<String>,
     pub text: String,
 }
 
@@ -162,7 +180,26 @@ fn safe_template_name(name: &str) -> Result<String, String> {
     Ok(format!("{stem}.md"))
 }
 
-fn read_template(root: &Path, path: PathBuf) -> Result<PromptTemplate, String> {
+fn modified_time_string(path: &Path) -> Option<String> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let seconds = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(format!("unix:{seconds}"))
+}
+
+fn template_description(text: &str) -> String {
+    text.lines()
+        .find(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('#')
+        })
+        .map(str::trim)
+        .unwrap_or("")
+        .chars()
+        .take(120)
+        .collect()
+}
+
+fn read_template(root: &Path, path: PathBuf, include_text: bool) -> Result<PromptTemplate, String> {
     let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let name = path
         .file_name()
@@ -172,7 +209,9 @@ fn read_template(root: &Path, path: PathBuf) -> Result<PromptTemplate, String> {
         name,
         path: to_workspace_relative(root, &path),
         bytes: text.len(),
-        text,
+        description: template_description(&text),
+        modified_time: modified_time_string(&path),
+        text: if include_text { text } else { String::new() },
     })
 }
 
@@ -184,14 +223,18 @@ pub fn init(workspace_root: &str) -> Result<PromptTemplatesOutput, String> {
 
 pub fn list(workspace_root: &str) -> Result<PromptTemplatesOutput, String> {
     let root = workspace_root_path(workspace_root)?;
-    ensure_default_templates(&root)?;
     list_from_root(&root)
 }
 
 fn list_from_root(root: &Path) -> Result<PromptTemplatesOutput, String> {
     let dir = prompts_root(root);
-    let mut paths = fs::read_dir(&dir)
-        .map_err(|e| e.to_string())?
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(PromptTemplatesOutput {
+            root: to_workspace_relative(root, &dir),
+            templates: Vec::new(),
+        });
+    };
+    let mut paths = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
@@ -199,7 +242,7 @@ fn list_from_root(root: &Path) -> Result<PromptTemplatesOutput, String> {
     paths.sort();
     let mut templates = Vec::new();
     for path in paths {
-        templates.push(read_template(root, path)?);
+        templates.push(read_template(root, path, false)?);
     }
     Ok(PromptTemplatesOutput {
         root: to_workspace_relative(root, &dir),
@@ -209,7 +252,6 @@ fn list_from_root(root: &Path) -> Result<PromptTemplatesOutput, String> {
 
 pub fn read(workspace_root: &str, name: &str) -> Result<PromptTemplatesOutput, String> {
     let root = workspace_root_path(workspace_root)?;
-    ensure_default_templates(&root)?;
     let name = safe_template_name(name)?;
     let path = prompts_root(&root).join(name);
     if !path.is_file() {
@@ -222,7 +264,7 @@ pub fn read(workspace_root: &str, name: &str) -> Result<PromptTemplatesOutput, S
     }
     Ok(PromptTemplatesOutput {
         root: to_workspace_relative(&root, &prompts_root(&root)),
-        templates: vec![read_template(&root, path)?],
+        templates: vec![read_template(&root, path, true)?],
     })
 }
 
@@ -233,7 +275,7 @@ pub fn write(
     overwrite: bool,
 ) -> Result<PromptTemplateWriteOutput, String> {
     let root = workspace_root_path(workspace_root)?;
-    ensure_default_templates(&root)?;
+    fs::create_dir_all(prompts_root(&root)).map_err(|e| e.to_string())?;
     let name = safe_template_name(name)?;
     let path = prompts_root(&root).join(name);
     let created = !path.exists();
@@ -243,7 +285,7 @@ pub fn write(
     let text = normalize_markdown(content);
     fs::write(&path, text).map_err(|e| e.to_string())?;
     Ok(PromptTemplateWriteOutput {
-        template: read_template(&root, path)?,
+        template: read_template(&root, path, true)?,
         created,
     })
 }
@@ -267,7 +309,13 @@ mod tests {
 
         let initial = init(&workspace.to_string_lossy()).expect("init templates");
         assert_eq!(initial.root, ".catdesk/prompts");
-        assert!(initial.templates.len() >= 3);
+        assert_eq!(initial.templates.len(), 6);
+        assert!(
+            initial
+                .templates
+                .iter()
+                .all(|template| template.text.is_empty())
+        );
 
         let written = write(
             &workspace.to_string_lossy(),
@@ -282,6 +330,19 @@ mod tests {
         let read_output = read(&workspace.to_string_lossy(), "bug-report").expect("read template");
         assert_eq!(read_output.templates.len(), 1);
         assert!(read_output.templates[0].text.contains("Steps:"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn list_does_not_initialize_or_return_bodies() {
+        let workspace = test_workspace("list-no-init");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let listed = list(&workspace.to_string_lossy()).expect("list templates");
+
+        assert!(listed.templates.is_empty());
+        assert!(!workspace.join(CATDESK_DIR).exists());
 
         let _ = fs::remove_dir_all(workspace);
     }

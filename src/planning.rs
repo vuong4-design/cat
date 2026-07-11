@@ -14,6 +14,12 @@ pub struct CurrentPlanOutput {
     pub text: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanPolicyStatus {
+    pub plan_required: bool,
+    pub has_plan: bool,
+}
+
 impl CurrentPlanOutput {
     pub fn render_text(&self) -> String {
         format!(
@@ -67,6 +73,50 @@ fn parse_plan_required(text: &str) -> bool {
         .find_map(|line| line.strip_prefix("plan_required:"))
         .map(|value| value.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+fn plan_body(text: &str) -> String {
+    let mut in_plan = false;
+    let mut body = String::new();
+    for line in text.lines() {
+        if line.trim() == "## Plan" {
+            in_plan = true;
+            continue;
+        }
+        if in_plan && line.starts_with("## ") {
+            break;
+        }
+        if in_plan {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    body
+}
+
+fn has_non_empty_plan(text: &str) -> bool {
+    let body = plan_body(text);
+    let body = body.trim();
+    !body.is_empty() && body != "_No current plan recorded._"
+}
+
+pub fn policy_status(workspace_root: &str) -> Result<PlanPolicyStatus, String> {
+    let root = workspace_root_path(workspace_root)?;
+    let path = plan_path(&root);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PlanPolicyStatus {
+                plan_required: false,
+                has_plan: false,
+            });
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(PlanPolicyStatus {
+        plan_required: parse_plan_required(&text),
+        has_plan: has_non_empty_plan(&text),
+    })
 }
 
 pub fn update(
@@ -133,6 +183,23 @@ mod tests {
         let read_output = read(&workspace.to_string_lossy()).expect("read plan");
         assert!(read_output.plan_required);
         assert!(read_output.text.contains("1. Inspect"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn policy_status_requires_non_empty_plan_body() {
+        let workspace = test_workspace("policy");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        update(&workspace.to_string_lossy(), "", true).expect("empty required plan");
+        let status = policy_status(&workspace.to_string_lossy()).expect("read policy");
+        assert!(status.plan_required);
+        assert!(!status.has_plan);
+
+        update(&workspace.to_string_lossy(), "1. Inspect first", true).expect("real plan");
+        let status = policy_status(&workspace.to_string_lossy()).expect("read policy");
+        assert!(status.has_plan);
 
         let _ = fs::remove_dir_all(workspace);
     }

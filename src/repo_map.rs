@@ -1,5 +1,6 @@
 use crate::command;
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,8 @@ const IGNORED_DIRS: &[&str] = &[
     ".idea",
     ".vscode",
     ".catdesk",
+    ".venv",
+    "venv",
     "target",
     "node_modules",
     "dist",
@@ -98,6 +101,8 @@ fn file_language(path: &Path) -> Option<&'static str> {
         Some("js") | Some("mjs") | Some("cjs") => Some("JavaScript"),
         Some("ts") | Some("tsx") => Some("TypeScript"),
         Some("py") => Some("Python"),
+        Some("go") => Some("Go"),
+        Some("java") => Some("Java"),
         Some("html") | Some("htm") => Some("HTML"),
         Some("css") => Some("CSS"),
         Some("json") => Some("JSON"),
@@ -209,31 +214,72 @@ fn detect_important_folders(root: &Path, files: &[PathBuf]) -> Vec<String> {
 }
 
 fn detect_entry_points(root: &Path, files: &[PathBuf]) -> Vec<String> {
-    let candidates = [
-        "src/main.rs",
-        "src/server.rs",
-        "src/mcp.rs",
-        "src/command.rs",
-        "src/workspace_tools.rs",
-        "src/devtools.rs",
-        "src/ngrok.rs",
-        "package.json",
-        "npm/catdesk.js",
-        "npm/postinstall.js",
-        "extensions/catdesk-auto-approval/manifest.json",
-        "extensions/catdesk-auto-approval/content.js",
-        "extensions/catdesk-auto-approval/background.js",
-    ];
     let existing = files
         .iter()
         .map(|file| to_workspace_relative(root, file))
         .collect::<BTreeSet<_>>();
-    candidates
-        .iter()
-        .filter(|candidate| existing.contains(**candidate))
-        .take(MAX_ENTRY_POINTS)
-        .map(|candidate| candidate.to_string())
-        .collect()
+    let mut entries = BTreeSet::new();
+
+    for candidate in ["src/main.rs", "main.py", "app.py", "wsgi.py", "asgi.py"] {
+        if existing.contains(candidate) {
+            entries.insert(candidate.to_string());
+        }
+    }
+    for file in &existing {
+        if file.starts_with("src/bin/") && file.ends_with(".rs") {
+            entries.insert(file.clone());
+        }
+        if file.ends_with("/__main__.py") {
+            entries.insert(file.clone());
+        }
+    }
+    if let Ok(package_text) = fs::read_to_string(root.join("package.json")) {
+        if let Ok(package) = serde_json::from_str::<Value>(&package_text) {
+            for field in ["main", "module", "browser"] {
+                if let Some(path) = package.get(field).and_then(Value::as_str) {
+                    if existing.contains(path) {
+                        entries.insert(format!("package.json {field}: {path}"));
+                    }
+                }
+            }
+            if let Some(bin) = package.get("bin") {
+                match bin {
+                    Value::String(path) if existing.contains(path.as_str()) => {
+                        entries.insert(format!("package.json bin: {path}"));
+                    }
+                    Value::Object(map) => {
+                        for (name, path) in map {
+                            if let Some(path) =
+                                path.as_str().filter(|path| existing.contains(*path))
+                            {
+                                entries.insert(format!("package.json bin.{name}: {path}"));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for file in files {
+        let rel = to_workspace_relative(root, file);
+        if rel.ends_with(".go")
+            && fs::read_to_string(file)
+                .unwrap_or_default()
+                .lines()
+                .any(|line| line.trim() == "package main")
+        {
+            entries.insert(rel.clone());
+        }
+        if rel.ends_with(".java")
+            && fs::read_to_string(file)
+                .unwrap_or_default()
+                .contains("public static void main")
+        {
+            entries.insert(rel);
+        }
+    }
+    entries.into_iter().take(MAX_ENTRY_POINTS).collect()
 }
 
 fn detect_build_test_commands(root: &Path) -> Vec<String> {
@@ -246,18 +292,31 @@ fn detect_build_test_commands(root: &Path) -> Vec<String> {
         ]);
     }
     if root.join("package.json").is_file() {
+        let node_runner = node_package_manager(root);
         let package = fs::read_to_string(root.join("package.json")).unwrap_or_default();
         if package.contains("\"test\"") {
-            commands.push("npm test".to_string());
+            commands.push(format!("{node_runner} test"));
         }
         if package.contains("\"build\"") {
-            commands.push("npm run build".to_string());
+            commands.push(format!("{node_runner} run build"));
         }
         if package.contains("\"lint\"") {
-            commands.push("npm run lint".to_string());
+            commands.push(format!("{node_runner} run lint"));
         }
     }
     commands
+}
+
+fn node_package_manager(root: &Path) -> &'static str {
+    if root.join("pnpm-lock.yaml").is_file() {
+        "pnpm"
+    } else if root.join("yarn.lock").is_file() {
+        "yarn"
+    } else if root.join("bun.lockb").is_file() || root.join("bun.lock").is_file() {
+        "bun"
+    } else {
+        "npm"
+    }
 }
 
 fn markdown_list(items: &[String]) -> String {
@@ -337,6 +396,12 @@ mod tests {
         )
         .expect("write cargo");
         fs::write(workspace.join("src").join("main.rs"), "fn main() {}\n").expect("write main");
+        fs::create_dir_all(workspace.join("cmd").join("demo")).expect("create go dir");
+        fs::write(
+            workspace.join("cmd").join("demo").join("main.go"),
+            "package main\nfunc main() {}\n",
+        )
+        .expect("write go main");
         fs::write(
             workspace.join("target").join("debug").join("generated.rs"),
             "ignored\n",
@@ -361,11 +426,35 @@ mod tests {
         assert!(output.entry_points.contains(&"src/main.rs".to_string()));
         assert!(
             output
+                .entry_points
+                .contains(&"cmd/demo/main.go".to_string())
+        );
+        assert!(
+            output
                 .build_test_commands
                 .contains(&"cargo test".to_string())
         );
         assert!(!output.text.contains("node_modules/pkg"));
         assert!(workspace.join(".catdesk").join("repo_map.md").is_file());
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn detect_build_test_commands_uses_detected_node_package_manager() {
+        let workspace = test_workspace("pnpm");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::write(
+            workspace.join("package.json"),
+            r#"{"scripts":{"test":"vitest","build":"vite build","lint":"eslint ."}}"#,
+        )
+        .expect("write package");
+        fs::write(workspace.join("pnpm-lock.yaml"), "").expect("write lockfile");
+
+        let commands = detect_build_test_commands(&workspace);
+        assert!(commands.contains(&"pnpm test".to_string()));
+        assert!(commands.contains(&"pnpm run build".to_string()));
+        assert!(commands.contains(&"pnpm run lint".to_string()));
 
         let _ = fs::remove_dir_all(workspace);
     }

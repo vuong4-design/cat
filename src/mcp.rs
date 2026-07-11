@@ -2,12 +2,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tiktoken_rs::o200k_base_singleton;
 use tokio::sync::Mutex;
 
+use crate::app_info::CATDESK_VERSION;
 use crate::command;
 use crate::devtools::DevtoolsBridge;
 use crate::git_workflow;
@@ -25,7 +28,7 @@ use crate::verification;
 use crate::workspace_tools;
 
 const SERVER_NAME: &str = "catdesk";
-const SERVER_VERSION: &str = "4.0.0";
+const SERVER_VERSION: &str = CATDESK_VERSION;
 const PROTOCOL_VERSION: &str = "2025-03-26";
 const UI_TEMPLATE_URI: &str = "ui://widget/catdesk-dashboard.html";
 const UI_TEMPLATE_MIME_TYPE: &str = "text/html;profile=mcp-app";
@@ -347,7 +350,8 @@ async fn handle_tools_list(
                         "command": { "type": "string", "description": "The shell command to execute" },
                         "cwd": { "type": "string", "description": "Working directory relative to workspace root or absolute path within it" },
                         "timeout": { "type": "number", "description": "Timeout in milliseconds. Clamped to 120000." },
-                        "dry_run": { "type": "boolean", "description": "Preview the command without executing it." }
+                        "dry_run": { "type": "boolean", "description": "Preview the command without executing it." },
+                        "include_full_output": { "type": "boolean", "description": "Include raw stdout/stderr in the tool result. Defaults to false; captured logs are saved under .catdesk/logs." }
                     },
                     "required": ["command"]
                 },
@@ -405,7 +409,7 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "project_memory_read",
             "title": "Read project memory",
-            "description": "Read Markdown project memory files from .catdesk. Automatically initializes missing files.",
+            "description": "Read Markdown project memory files from .catdesk. Missing files are returned as in-memory defaults until initialized.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -430,7 +434,7 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "task_queue_read",
             "title": "Read task queue",
-            "description": "Read .catdesk/todo.md as a Markdown checkbox task queue. Automatically initializes the file if missing.",
+            "description": "Read .catdesk/todo.md as a Markdown checkbox task queue. Missing files are returned as an in-memory empty queue until initialized.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -440,7 +444,7 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "prompt_templates_list",
             "title": "List prompt templates",
-            "description": "List reusable Markdown prompt templates under .catdesk/prompts. Automatically initializes default templates if missing.",
+            "description": "List reusable Markdown prompt templates under .catdesk/prompts. Missing default templates are returned as in-memory defaults until initialized.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -535,20 +539,20 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "task_queue_set_status",
                 "title": "Set task queue status",
-                "description": "Mark a numbered task in .catdesk/todo.md done or open while preserving Markdown content around the list.",
+                "description": "Mark a stable-ID task in .catdesk/todo.md done or open while preserving Markdown content around the list.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "index": {
-                            "type": "integer",
-                            "description": "1-based task index from task_queue_read."
+                        "id": {
+                            "type": "string",
+                            "description": "Stable task ID from task_queue_read, for example T-0001."
                         },
                         "done": {
                             "type": "boolean",
                             "description": "true marks the task done; false marks it open."
                         }
                     },
-                    "required": ["index", "done"]
+                    "required": ["id", "done"]
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }));
@@ -641,7 +645,9 @@ async fn handle_tools_list(
                 "description": "Detect Rust, Python, and Node project surfaces and run their standard verification commands, returning summarized output.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {}
+                    "properties": {
+                        "timeout": { "type": "number", "description": "Per-command timeout in milliseconds. Defaults to 120000." }
+                    }
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": false }
             }));
@@ -671,24 +677,35 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "git_diff_summary",
                 "title": "Git diff summary",
-                "description": "Summarize unstaged git diff by file and stat.",
+                "description": "Summarize staged, unstaged, untracked, deleted, renamed, and optionally ignored git paths.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {}
+                    "properties": {
+                        "include_ignored": { "type": "boolean", "description": "Include ignored files from git status --ignored." }
+                    }
                 },
                 "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
             }));
             tools.push(json!({
                 "name": "git_commit_verified",
                 "title": "Commit verified changes",
-                "description": "Run project verification, stage changes, and create a git commit if verification passes. Can be explicitly allowed to commit after failed verification.",
+                "description": "Run project verification, stage only explicit files, and create a git commit if verification passes.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "message": { "type": "string", "description": "Commit message" },
-                        "allow_failed_verification": { "type": "boolean", "description": "Allow commit even when verification fails" }
+                        "files": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Explicit workspace-relative files to stage before committing."
+                        },
+                        "allow_failed_verification": { "type": "boolean", "description": "Allow commit when verification is FAILED or NOT_CONFIGURED." },
+                        "allow_partial_verification": { "type": "boolean", "description": "Allow commit when verification is PARTIAL." },
+                        "allow_main": { "type": "boolean", "description": "Allow committing on main/master. Defaults to false." },
+                        "dry_run": { "type": "boolean", "description": "Run verification, stage only explicit files, preview the commit, and return a short-lived confirmation token." },
+                        "commit_confirmation_token": { "type": "string", "description": "Token returned by a matching dry_run=true call. Required when dry_run is false." }
                     },
-                    "required": ["message"]
+                    "required": ["message", "files"]
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
             }));
@@ -734,7 +751,7 @@ async fn handle_tools_list(
                     "properties": {
                         "path": { "type": "string" },
                         "recursive": { "type": "boolean", "description": "Delete directories recursively" },
-                        "confirm": { "type": "boolean", "description": "Must be true to actually delete anything" },
+                        "confirmation_token": { "type": "string", "description": "Token returned by a prior dry_run=true delete preview" },
                         "dry_run": { "type": "boolean", "description": "Preview the delete without removing anything" }
                     },
                     "required": ["path"]
@@ -758,6 +775,7 @@ async fn handle_tools_list(
     }
 
     for tool in &mut tools {
+        ensure_tool_descriptor_plan_override(tool);
         ensure_tool_descriptor_widget_template(tool);
     }
 
@@ -781,6 +799,12 @@ async fn handle_tools_call(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    if plan_guard_applies(&tool_name) && !tool_call_bool_argument(req, "dry_run", false) {
+        match enforce_plan_guard(req, workspace_root, &tool_name) {
+            Ok(()) => {}
+            Err(response) => return response,
+        }
+    }
 
     let watch_targets = collect_watch_targets(req, workspace_root);
     let before_snapshot = collect_watched_snapshot(&watch_targets, workspace_root);
@@ -993,6 +1017,10 @@ async fn handle_run_command(
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let include_full_output = arguments
+        .get("include_full_output")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     if command::contains_catdesk_co_author_marker(cmd) {
         let message = if set_catdesk_as_co_author {
@@ -1090,18 +1118,33 @@ async fn handle_run_command(
         );
     }
 
+    if let Err(error) = validate_shell_mode(workspace_root, &cwd, &effective_command) {
+        return tool_error_response(req, format!("code: SHELL_MODE_BLOCKED\nmessage: {error}"));
+    }
+
     let result = command::run_command(&effective_command, &cwd, effective_timeout).await;
     let summary = command::summarize_result(&result);
-    let output = command::format_result(&result);
+    let full_output = command::format_result(&result);
+    let log_path = match write_command_log(workspace_root, &effective_command, &cwd, &full_output) {
+        Ok(path) => path,
+        Err(e) => return tool_error_response(req, e),
+    };
+    let output = if include_full_output {
+        full_output
+    } else {
+        render_command_summary_text(&summary, &log_path)
+    };
     let structured = json!({
         "toolName": "run_command",
         "command": effective_command,
         "cwd": cwd.to_string_lossy().to_string(),
-        "stdout": result.stdout,
-        "stderr": result.stderr,
+        "stdout": if include_full_output { result.stdout } else { String::new() },
+        "stderr": if include_full_output { result.stderr } else { String::new() },
         "success": result.success,
         "exitCode": result.exit_code,
         "elapsedMs": result.elapsed_ms,
+        "logPath": log_path,
+        "includeFullOutput": include_full_output,
         "summary": command_summary_json(&summary),
     });
 
@@ -1119,6 +1162,329 @@ fn command_summary_json(summary: &command::CommandSummary) -> Value {
         "errors": summary.errors,
         "keyOutput": summary.key_output,
     })
+}
+
+fn render_command_summary_text(summary: &command::CommandSummary, log_path: &str) -> String {
+    let mut out = format!(
+        "status: {}\nexit_code: {}\nlog: {}\n",
+        summary.status,
+        summary
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "none".into()),
+        log_path,
+    );
+    if !summary.errors.is_empty() {
+        out.push_str("\nerrors:\n");
+        for line in &summary.errors {
+            out.push_str("- ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !summary.key_output.is_empty() {
+        out.push_str("\nkey output:\n");
+        for line in &summary.key_output {
+            out.push_str("- ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn write_command_log(
+    workspace_root: &str,
+    command_text: &str,
+    cwd: &Path,
+    full_output: &str,
+) -> Result<String, String> {
+    let root = Path::new(workspace_root)
+        .canonicalize()
+        .map(command::normalize_windows_verbatim_path)
+        .map_err(|e| e.to_string())?;
+    let logs_dir = root.join(".catdesk").join("logs");
+    fs::create_dir_all(&logs_dir).map_err(|e| e.to_string())?;
+    ensure_catdesk_logs_gitignore(&root)?;
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let file_name = format!("{seconds}-{}.log", uuid::Uuid::new_v4());
+    let path = logs_dir.join(file_name);
+    let redacted_command = redact_sensitive_lines(command_text);
+    let redacted_output = redact_sensitive_lines(full_output);
+    let text = format!(
+        "command: {redacted_command}\ncwd: {}\n\n{}",
+        cwd.display(),
+        redacted_output
+    );
+    fs::write(&path, text).map_err(|e| e.to_string())?;
+    Ok(to_relative(&root, &path))
+}
+
+fn ensure_catdesk_logs_gitignore(root: &Path) -> Result<(), String> {
+    let gitignore = root.join(".catdesk").join(".gitignore");
+    let mut text = fs::read_to_string(&gitignore).unwrap_or_default();
+    if !text.lines().any(|line| line.trim() == "logs/") {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("logs/\n");
+        fs::write(gitignore, text).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn redact_sensitive_lines(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if [
+                "api_key",
+                "apikey",
+                "access_token",
+                "auth_token",
+                "authorization:",
+                "bearer ",
+                "password",
+                "secret",
+                "private_key",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle))
+            {
+                "[redacted line containing possible secret]".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ShellMode {
+    Disabled,
+    Allowlist,
+    Unrestricted,
+}
+
+fn configured_shell_mode(workspace_root: &str) -> ShellMode {
+    let config_path = Path::new(workspace_root)
+        .join(".catdesk")
+        .join("config.toml");
+    let Ok(text) = fs::read_to_string(config_path) else {
+        return ShellMode::Allowlist;
+    };
+    match text
+        .parse::<toml::Value>()
+        .ok()
+        .and_then(|value| {
+            value
+                .get("shell_mode")
+                .and_then(toml::Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+    {
+        Some("unrestricted") => ShellMode::Unrestricted,
+        Some("disabled") => ShellMode::Disabled,
+        _ => ShellMode::Allowlist,
+    }
+}
+
+fn destructive_delete_enabled(workspace_root: &str) -> bool {
+    let config_path = Path::new(workspace_root)
+        .join(".catdesk")
+        .join("config.toml");
+    let Ok(text) = fs::read_to_string(config_path) else {
+        return false;
+    };
+    text.parse::<toml::Value>()
+        .ok()
+        .and_then(|value| {
+            value
+                .get("destructive_delete_enabled")
+                .and_then(toml::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn validate_shell_mode(workspace_root: &str, cwd: &Path, command_text: &str) -> Result<(), String> {
+    match configured_shell_mode(workspace_root) {
+        ShellMode::Disabled => {
+            Err("shell_mode is disabled. Use dedicated CatDesk tools or configure shell_mode = \"allowlist\"/\"unrestricted\".".into())
+        }
+        ShellMode::Unrestricted => Ok(()),
+        ShellMode::Allowlist => validate_allowlisted_shell(workspace_root, cwd, command_text),
+    }
+}
+
+fn validate_allowlisted_shell(
+    workspace_root: &str,
+    cwd: &Path,
+    command_text: &str,
+) -> Result<(), String> {
+    let root = Path::new(workspace_root)
+        .canonicalize()
+        .map(command::normalize_windows_verbatim_path)
+        .map_err(|e| e.to_string())?;
+    let cwd = cwd
+        .canonicalize()
+        .map(command::normalize_windows_verbatim_path)
+        .map_err(|e| e.to_string())?;
+    if cwd != root {
+        return Err("allowlist shell mode only permits commands from the workspace root".into());
+    }
+    if contains_absolute_path_argument(command_text) {
+        return Err("allowlist shell mode rejects absolute path arguments".into());
+    }
+    if contains_shell_control_syntax(command_text) {
+        return Err(
+            "allowlist shell mode permits only one simple command; chaining, pipes, redirection, and command substitution are blocked."
+                .into(),
+        );
+    }
+    let words = simple_command_words(command_text);
+    let Some(command_name) = words.first().map(String::as_str) else {
+        return Err("empty shell command".into());
+    };
+    let base = Path::new(command_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command_name)
+        .to_ascii_lowercase();
+    match base.as_str() {
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" | "bash" | "sh" | "cmd"
+        | "cmd.exe" | "python" | "python.exe" | "node" | "node.exe" => {
+            Err("allowlist shell mode rejects nested shells and interpreters".into())
+        }
+        "cargo" => Ok(()),
+        "npm" | "pnpm" | "yarn" | "bun" => Ok(()),
+        "pytest" | "ruff" | "mypy" => Ok(()),
+        "git" => match words.get(1).map(String::as_str) {
+            Some("status" | "diff" | "log" | "show" | "rev-parse") => Ok(()),
+            _ => Err("allowlist shell mode permits only git status/diff/log/show/rev-parse".into()),
+        },
+        _ => Err(format!(
+            "allowlist shell mode rejected `{command_name}`. Configure shell_mode = \"unrestricted\" only if you accept that shell access is not sandboxed."
+        )),
+    }
+}
+
+fn simple_command_words(command_text: &str) -> Vec<String> {
+    command_text
+        .split_whitespace()
+        .map(|word| word.trim_matches(['"', '\'']).to_string())
+        .collect()
+}
+
+fn contains_shell_control_syntax(command_text: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut chars = command_text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if in_single || in_double {
+            continue;
+        }
+        match ch {
+            ';' | '|' | '&' | '<' | '>' | '`' | '\n' | '\r' => return true,
+            '$' if matches!(chars.peek(), Some('(')) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn contains_absolute_path_argument(command_text: &str) -> bool {
+    simple_command_words(command_text)
+        .iter()
+        .skip(1)
+        .any(|word| {
+            Path::new(word).is_absolute()
+                || word.starts_with("\\\\")
+                || (word.len() >= 3
+                    && word.as_bytes()[1] == b':'
+                    && matches!(word.as_bytes()[2], b'\\' | b'/'))
+        })
+}
+
+fn delete_confirmation_token(path: &Path, recursive: bool) -> Result<String, String> {
+    let issued_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let fingerprint = delete_confirmation_fingerprint(path, recursive)?;
+    Ok(format!("delete:{issued_at}:{fingerprint:016x}"))
+}
+
+fn validate_delete_confirmation_token(
+    path: &Path,
+    recursive: bool,
+    token: &str,
+) -> Result<(), String> {
+    let mut parts = token.split(':');
+    if parts.next() != Some("delete") {
+        return Err("Use dry_run=true first and pass the returned confirmation_token.".into());
+    }
+    let issued_at = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| "Invalid delete confirmation token.".to_string())?;
+    let fingerprint = parts
+        .next()
+        .and_then(|value| u64::from_str_radix(value, 16).ok())
+        .ok_or_else(|| "Invalid delete confirmation token.".to_string())?;
+    if parts.next().is_some() {
+        return Err("Invalid delete confirmation token.".into());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    if now.saturating_sub(issued_at) > 600 {
+        return Err("Delete confirmation token expired; run dry_run=true again.".into());
+    }
+    let expected = delete_confirmation_fingerprint(path, recursive)?;
+    if fingerprint != expected {
+        return Err("Delete confirmation token does not match the current path state.".into());
+    }
+    Ok(())
+}
+
+fn delete_confirmation_fingerprint(path: &Path, recursive: bool) -> Result<u64, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let mut hasher = DefaultHasher::new();
+    path.display().to_string().hash(&mut hasher);
+    recursive.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    metadata.file_type().is_dir().hash(&mut hasher);
+    modified.hash(&mut hasher);
+    Ok(hasher.finish())
 }
 
 struct ResolvedMovePathIntercept {
@@ -1322,6 +1688,55 @@ fn build_run_command_listing_structured(
         "listLimit": listing.limit,
         "listEntries": listing.entries,
     })
+}
+
+fn tool_call_bool_argument(req: &JsonRpcRequest, name: &str, default_value: bool) -> bool {
+    tool_arguments(req)
+        .get(name)
+        .and_then(Value::as_bool)
+        .unwrap_or(default_value)
+}
+
+fn plan_guard_applies(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "run_command"
+            | "write"
+            | "edit"
+            | "delete"
+            | "project_memory_init"
+            | "project_memory_update"
+            | "session_resume_update"
+            | "repo_map_generate"
+            | "verify_project"
+            | "task_queue_add"
+            | "task_queue_set_status"
+            | "prompt_templates_init"
+            | "prompt_template_write"
+            | "git_create_feature_branch"
+            | "git_commit_verified"
+    )
+}
+
+fn enforce_plan_guard(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    tool_name: &str,
+) -> Result<(), JsonRpcResponse> {
+    if tool_call_bool_argument(req, "allow_without_plan", false) {
+        return Ok(());
+    }
+    let status =
+        planning::policy_status(workspace_root).map_err(|e| tool_error_response(req, e))?;
+    if status.plan_required && !status.has_plan {
+        return Err(tool_error_response(
+            req,
+            format!(
+                "code: PLAN_REQUIRED\nmessage: {tool_name} is blocked because .catdesk/current_plan.md has plan_required=true but no non-empty plan. Use plan_update to record a plan, or pass allow_without_plan=true for an explicit override."
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn tool_response(
@@ -1600,6 +2015,10 @@ Always specify the branch explicitly when using `git push`."#
         if tool_mode.run_command_enabled() {
             lines.push(
                 "For directory inspection, run_command can intercept plain listing commands such as find, tree, ls -R, and rg --files."
+                    .to_string(),
+            );
+            lines.push(
+                "Shell safety is guardrails, not containment. Default shell_mode is allowlist; shell_mode=\"unrestricted\" is not a sandbox and can access the local machine like a normal shell."
                     .to_string(),
             );
         }
@@ -1923,6 +2342,28 @@ fn ensure_tool_descriptor_widget_template(tool: &mut Value) {
         .entry("_meta".to_string())
         .or_insert_with(|| json!({}));
     ensure_output_template_meta_with_uri(meta_value, &resource_uri);
+}
+
+fn ensure_tool_descriptor_plan_override(tool: &mut Value) {
+    let Some(name) = tool.get("name").and_then(Value::as_str) else {
+        return;
+    };
+    if !plan_guard_applies(name) {
+        return;
+    }
+    let Some(properties) = tool
+        .get_mut("inputSchema")
+        .and_then(|schema| schema.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    properties.entry("allow_without_plan".to_string()).or_insert_with(|| {
+        json!({
+            "type": "boolean",
+            "description": "Explicitly bypass plan_required enforcement for this call. Defaults to false."
+        })
+    });
 }
 
 fn extract_tool_result_text(result: &Value) -> String {
@@ -3235,16 +3676,15 @@ fn handle_task_queue_add(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcR
 
 fn handle_task_queue_set_status(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
-    let index = match optional_usize_argument(&arguments, "index") {
-        Ok(Some(value)) => value,
-        Ok(None) => return tool_error_response(req, "Missing required parameter: index".into()),
+    let id = match required_string_argument(&arguments, "id") {
+        Ok(value) => value,
         Err(e) => return tool_error_response(req, e),
     };
     let done = match optional_bool_argument(&arguments, "done", false) {
         Ok(value) => value,
         Err(e) => return tool_error_response(req, e),
     };
-    match task_queue::set_status(workspace_root, index, done) {
+    match task_queue::set_status(workspace_root, id, done) {
         Ok(output) => {
             let text = output.render_text();
             tool_success_response_with_structured(
@@ -3408,6 +3848,7 @@ fn handle_session_resume_update(req: &JsonRpcRequest, workspace_root: &str) -> J
                     "verificationResults": output.verification_results,
                     "remainingWork": output.remaining_work,
                     "resumePrompt": output.resume_prompt,
+                    "timestamp": output.timestamp,
                 }),
             )
         }
@@ -3441,7 +3882,13 @@ fn handle_repo_map_generate(req: &JsonRpcRequest, workspace_root: &str) -> JsonR
 }
 
 async fn handle_verify_project(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
-    match verification::verify_project(workspace_root).await {
+    let arguments = tool_arguments(req);
+    let timeout_ms = arguments
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .unwrap_or(120_000)
+        .clamp(1_000, 600_000);
+    match verification::verify_project_with_timeout(workspace_root, timeout_ms).await {
         Ok(output) => {
             let text = output.render_text();
             tool_success_response_with_structured(
@@ -3450,8 +3897,10 @@ async fn handle_verify_project(req: &JsonRpcRequest, workspace_root: &str) -> Js
                 json!({
                     "toolName": "verify_project",
                     "success": output.success,
+                    "status": output.status,
                     "commands": output.commands,
                     "skipped": output.skipped,
+                    "timeoutMs": timeout_ms,
                 }),
             )
         }
@@ -3509,7 +3958,12 @@ async fn handle_git_create_feature_branch(
 }
 
 async fn handle_git_diff_summary(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
-    match git_workflow::diff_summary(workspace_root).await {
+    let arguments = tool_arguments(req);
+    let include_ignored = match optional_bool_argument(&arguments, "include_ignored", false) {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+    match git_workflow::diff_summary(workspace_root, include_ignored).await {
         Ok(output) => {
             let text = output.summary.clone();
             tool_success_response_with_structured(
@@ -3517,7 +3971,12 @@ async fn handle_git_diff_summary(req: &JsonRpcRequest, workspace_root: &str) -> 
                 text,
                 json!({
                     "toolName": "git_diff_summary",
-                    "nameStatus": output.name_status,
+                    "staged": output.staged,
+                    "unstaged": output.unstaged,
+                    "untracked": output.untracked,
+                    "deleted": output.deleted,
+                    "renamed": output.renamed,
+                    "ignored": output.ignored,
                     "stat": output.stat,
                     "summary": output.summary,
                 }),
@@ -3538,8 +3997,39 @@ async fn handle_git_commit_verified(req: &JsonRpcRequest, workspace_root: &str) 
             Ok(value) => value,
             Err(e) => return tool_error_response(req, e),
         };
-    match git_workflow::commit_verified_changes(workspace_root, message, allow_failed_verification)
-        .await
+    let allow_partial_verification =
+        match optional_bool_argument(&arguments, "allow_partial_verification", false) {
+            Ok(value) => value,
+            Err(e) => return tool_error_response(req, e),
+        };
+    let allow_main = match optional_bool_argument(&arguments, "allow_main", false) {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+    let dry_run = match optional_bool_argument(&arguments, "dry_run", false) {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+    let files = match string_array_argument(&arguments, "files") {
+        Ok(value) => value,
+        Err(e) => return tool_error_response(req, e),
+    };
+    let commit_confirmation_token =
+        match optional_string_argument(&arguments, "commit_confirmation_token") {
+            Ok(value) => value,
+            Err(e) => return tool_error_response(req, e),
+        };
+    match git_workflow::commit_verified_changes(
+        workspace_root,
+        message,
+        files,
+        allow_failed_verification,
+        allow_partial_verification,
+        allow_main,
+        dry_run,
+        commit_confirmation_token,
+    )
+    .await
     {
         Ok(output) => {
             let text = output.commit.summary.clone();
@@ -3549,8 +4039,12 @@ async fn handle_git_commit_verified(req: &JsonRpcRequest, workspace_root: &str) 
                 json!({
                     "toolName": "git_commit_verified",
                     "success": output.success,
-                    "verificationSuccess": output.verification_success,
+                    "dryRun": output.dry_run,
+                    "verificationStatus": output.verification_status,
                     "verificationSummary": output.verification_summary,
+                    "stagedFiles": output.staged_files,
+                    "confirmationToken": output.confirmation_token,
+                    "commitPreview": output.commit_preview,
                     "commit": output.commit,
                 }),
             )
@@ -3565,6 +4059,9 @@ fn handle_write_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespo
         Some(v) => v,
         None => return tool_error_response(req, "Missing required parameter: path".into()),
     };
+    if let Err(e) = validate_generic_file_tool_target(workspace_root, path, "write") {
+        return tool_error_response(req, e);
+    }
     let content = match arguments.get("content").and_then(|v| v.as_str()) {
         Some(v) => v,
         None => return tool_error_response(req, "Missing required parameter: content".into()),
@@ -3629,6 +4126,9 @@ fn handle_edit_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespon
         Some(v) => v,
         None => return tool_error_response(req, "Missing required parameter: path".into()),
     };
+    if let Err(e) = validate_generic_file_tool_target(workspace_root, path, "edit") {
+        return tool_error_response(req, e);
+    }
     let old_string = match arguments.get("old_string").and_then(|v| v.as_str()) {
         Some(v) => v,
         None => return tool_error_response(req, "Missing required parameter: old_string".into()),
@@ -3835,14 +4335,17 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
         Some(v) => v,
         None => return tool_error_response(req, "Missing required parameter: path".into()),
     };
+    if let Err(e) = validate_generic_file_tool_target(workspace_root, path, "delete") {
+        return tool_error_response(req, e);
+    }
     let recursive = arguments
         .get("recursive")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let confirm = arguments
-        .get("confirm")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let confirmation_token = arguments
+        .get("confirmation_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let dry_run = arguments
         .get("dry_run")
         .and_then(|v| v.as_bool())
@@ -3863,24 +4366,45 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
             Ok(_) => "path",
             Err(_) => "missing path",
         };
+        let confirmation_token = match delete_confirmation_token(&target, recursive) {
+            Ok(value) => value,
+            Err(e) => return tool_error_response(req, e),
+        };
         return tool_success_response_with_structured(
             req,
-            format!("dry run: would delete {kind}: {}", target.display()),
+            format!(
+                "dry run: would delete {kind}: {}\nconfirmation_token: {}\nactual deletion also requires destructive_delete_enabled = true in .catdesk/config.toml",
+                target.display(),
+                confirmation_token
+            ),
             json!({
                 "toolName": "delete",
                 "path": path,
                 "recursive": recursive,
-                "confirm": confirm,
                 "dryRun": true,
                 "kind": kind,
+                "confirmationToken": confirmation_token,
+                "requiresConfig": "destructive_delete_enabled = true in .catdesk/config.toml",
                 "message": "dry run: path was not deleted",
             }),
         );
     }
-    if !confirm {
+    if !destructive_delete_enabled(workspace_root) {
         return tool_error_response(
             req,
-            "Delete requires confirm=true. Use dry_run=true to preview the delete first.".into(),
+            "code: DESTRUCTIVE_DELETE_DISABLED\nmessage: actual deletion requires destructive_delete_enabled = true in .catdesk/config.toml; run dry_run=true first to preview the target".into(),
+        );
+    }
+    let target = match command::resolve_workspace_path(workspace_root, Some(path)) {
+        Ok(value) => value,
+        Err(e) => {
+            return tool_error_response(req, format!("code: PATH_OUTSIDE_WORKSPACE\nmessage: {e}"));
+        }
+    };
+    if let Err(e) = validate_delete_confirmation_token(&target, recursive, confirmation_token) {
+        return tool_error_response(
+            req,
+            format!("code: DELETE_CONFIRMATION_REQUIRED\nmessage: {e}"),
         );
     }
     match workspace_tools::delete_path(workspace_root, path, recursive) {
@@ -3899,6 +4423,49 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
         }
         Err(e) => tool_error_response(req, e),
     }
+}
+
+fn validate_generic_file_tool_target(
+    workspace_root: &str,
+    path: &str,
+    operation: &str,
+) -> Result<(), String> {
+    let root = Path::new(workspace_root)
+        .canonicalize()
+        .map(command::normalize_windows_verbatim_path)
+        .map_err(|e| e.to_string())?;
+    let target = command::resolve_workspace_path(workspace_root, Some(path))?;
+    if target == root {
+        return Err(format!(
+            "code: PROTECTED_PATH\nmessage: {operation} cannot target the workspace root"
+        ));
+    }
+    let relative = target
+        .strip_prefix(&root)
+        .map_err(|e| e.to_string())?
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if relative
+        .first()
+        .is_some_and(|part| part.eq_ignore_ascii_case(".git"))
+    {
+        return Err(format!(
+            "code: PROTECTED_PATH\nmessage: {operation} cannot target .git; use dedicated Git tools"
+        ));
+    }
+    if relative
+        .first()
+        .is_some_and(|part| part.eq_ignore_ascii_case(".catdesk"))
+    {
+        return Err(format!(
+            "code: PROTECTED_PATH\nmessage: {operation} cannot target .catdesk control files; use dedicated CatDesk tools"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3957,6 +4524,53 @@ mod tests {
                 && entry.get("type").and_then(Value::as_str) != Some("text")),
             "tool result content must not contain text entries: {content:?}"
         );
+    }
+
+    #[test]
+    fn shell_allowlist_rejects_chaining_and_ignores_commented_config() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-shell-mode-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(workspace_root.join(".catdesk")).expect("create workspace");
+        std::fs::write(
+            workspace_root.join(".catdesk").join("config.toml"),
+            "# shell_mode = \"unrestricted\"\nshell_mode = \"allowlist\"\n",
+        )
+        .expect("write config");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        assert!(matches!(
+            configured_shell_mode(&workspace_root_str),
+            ShellMode::Allowlist
+        ));
+        assert!(
+            validate_allowlisted_shell(&workspace_root_str, &workspace_root, "cargo test ; whoami")
+                .is_err()
+        );
+        assert!(
+            validate_allowlisted_shell(&workspace_root_str, &workspace_root, "git status | more")
+                .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn generic_file_tools_reject_protected_paths() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-protected-path-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(workspace_root.join(".git")).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        assert!(validate_generic_file_tool_target(&workspace_root_str, ".", "delete").is_err());
+        assert!(
+            validate_generic_file_tool_target(&workspace_root_str, ".git/config", "write").is_err()
+        );
+        assert!(
+            validate_generic_file_tool_target(&workspace_root_str, ".catdesk/session.md", "edit")
+                .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
@@ -4082,6 +4696,179 @@ mod tests {
                 "prompt_template_read",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_tools_do_not_initialize_catdesk_files() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-read-only-clean-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        for (tool_name, arguments) in [
+            ("project_memory_read", json!({})),
+            ("task_queue_read", json!({})),
+            ("prompt_templates_list", json!({})),
+        ] {
+            let req = tool_call_request(tool_name, arguments);
+            let response = handle_tools_call(
+                &req,
+                &workspace_root_str,
+                1,
+                Mode::Both,
+                ToolMode::ReadOnly,
+                false,
+                &None,
+            )
+            .await;
+            assert_no_text_content(&response);
+            assert!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("isError"))
+                    .is_none(),
+                "{tool_name} returned error: {}",
+                result_text(&response)
+            );
+        }
+
+        let read_missing_template = tool_call_request(
+            "prompt_template_read",
+            json!({
+                "name": "start_session"
+            }),
+        );
+        let response = handle_tools_call(
+            &read_missing_template,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&response);
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(!workspace_root.join(".catdesk").exists());
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn json_rpc_lifecycle_exercises_router_and_tool_payloads() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-json-rpc-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let initialize = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("init")),
+            method: "initialize".into(),
+            params: json!({}),
+        };
+        let initialize_response = handle_request(
+            &initialize,
+            &workspace_root_str,
+            1,
+            None,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await
+        .expect("initialize response");
+        assert_eq!(
+            initialize_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("serverInfo"))
+                .and_then(|info| info.get("name"))
+                .and_then(Value::as_str),
+            Some("catdesk")
+        );
+
+        let tools_list = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("tools")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let tools_response = handle_request(
+            &tools_list,
+            &workspace_root_str,
+            1,
+            None,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await
+        .expect("tools response");
+        assert!(
+            tools_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("tools"))
+                .and_then(Value::as_array)
+                .is_some_and(|tools| tools
+                    .iter()
+                    .any(|tool| tool.get("name").and_then(Value::as_str) == Some("plan_update")))
+        );
+
+        let plan_req = tool_call_request(
+            "plan_update",
+            json!({
+                "plan": "1. Inspect\n2. Verify",
+                "plan_required": true
+            }),
+        );
+        let plan_response = handle_request(
+            &plan_req,
+            &workspace_root_str,
+            1,
+            None,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await
+        .expect("plan response");
+        assert_no_text_content(&plan_response);
+
+        let invalid = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("invalid")),
+            method: "nope".into(),
+            params: json!({}),
+        };
+        let invalid_response = handle_request(
+            &invalid,
+            &workspace_root_str,
+            1,
+            None,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await
+        .expect("invalid response");
+        assert!(invalid_response.error.is_some());
+
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
@@ -4224,6 +5011,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_required_blocks_mutating_and_shell_tools_without_plan() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-plan-guard-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let plan_req = tool_call_request(
+            "plan_update",
+            json!({
+                "plan": "",
+                "plan_required": true
+            }),
+        );
+        let plan_response = handle_tools_call(
+            &plan_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&plan_response);
+
+        for (tool_name, arguments) in [
+            (
+                "write",
+                json!({
+                    "path": "notes.txt",
+                    "content": "hello\n"
+                }),
+            ),
+            (
+                "run_command",
+                json!({
+                    "command": if cfg!(windows) { "Write-Output hello" } else { "echo hello" }
+                }),
+            ),
+        ] {
+            let req = tool_call_request(tool_name, arguments);
+            let response = handle_tools_call(
+                &req,
+                &workspace_root_str,
+                1,
+                Mode::Both,
+                ToolMode::MultiTools,
+                false,
+                &None,
+            )
+            .await;
+            assert_no_text_content(&response);
+            assert_eq!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool),
+                Some(true)
+            );
+            assert!(result_text(&response).contains("PLAN_REQUIRED"));
+        }
+
+        let override_req = tool_call_request(
+            "write",
+            json!({
+                "path": "notes.txt",
+                "content": "hello\n",
+                "allow_without_plan": true
+            }),
+        );
+        let override_response = handle_tools_call(
+            &override_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&override_response);
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("notes.txt")).expect("read notes"),
+            "hello\n"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn task_queue_tools_add_read_and_complete_todo() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-task-queue-{}", Uuid::new_v4()));
@@ -4251,7 +5129,7 @@ mod tests {
         let set_status_req = tool_call_request(
             "task_queue_set_status",
             json!({
-                "index": 2,
+                "id": "T-0001",
                 "done": true
             }),
         );
@@ -4289,7 +5167,7 @@ mod tests {
             structured
                 .get("text")
                 .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("- [x] Add task queue MCP test"))
+                .is_some_and(|text| text.contains("- [x] T-0001 Add task queue MCP test"))
         );
 
         let _ = std::fs::remove_dir_all(workspace_root);
@@ -4318,7 +5196,7 @@ mod tests {
             workspace_root
                 .join(".catdesk")
                 .join("prompts")
-                .join("implementation-plan.md")
+                .join("start_session.md")
                 .is_file()
         );
 
@@ -4366,6 +5244,14 @@ mod tests {
                     .iter()
                     .any(|template| template.get("name").and_then(Value::as_str)
                         == Some("release-notes.md")))
+        );
+        assert!(
+            list_structured
+                .get("templates")
+                .and_then(Value::as_array)
+                .is_some_and(|templates| templates
+                    .iter()
+                    .all(|template| template.get("text").and_then(Value::as_str) == Some("")))
         );
 
         let read_req =
@@ -4821,11 +5707,7 @@ mod tests {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-command-summary-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
-        let command = if cfg!(windows) {
-            "Write-Error 'summary boom'; exit 7"
-        } else {
-            "echo 'summary boom' >&2; exit 7"
-        };
+        let command = "git status --definitely-not-a-real-option";
 
         let req = tool_call_request(
             "run_command",
@@ -4859,7 +5741,7 @@ mod tests {
             .as_ref()
             .and_then(|result| result.get("structuredContent"))
             .expect("missing structured content");
-        assert_eq!(structured.get("exitCode").and_then(Value::as_i64), Some(7));
+        assert!(structured.get("exitCode").and_then(Value::as_i64).is_some());
         let summary = structured.get("summary").expect("missing summary");
         assert_eq!(
             summary.get("status").and_then(Value::as_str),
@@ -4869,9 +5751,7 @@ mod tests {
             summary
                 .get("errors")
                 .and_then(Value::as_array)
-                .is_some_and(|errors| errors.iter().any(|line| line
-                    .as_str()
-                    .is_some_and(|line| line.contains("summary boom"))))
+                .is_some_and(|errors| !errors.is_empty())
         );
 
         let widget_payload = response
@@ -4882,7 +5762,7 @@ mod tests {
             .expect("missing widget payload");
         assert_eq!(
             widget_payload.get("exitCode").and_then(Value::as_i64),
-            Some(7)
+            structured.get("exitCode").and_then(Value::as_i64)
         );
         assert!(widget_payload.get("summary").is_some());
 
@@ -4942,7 +5822,7 @@ mod tests {
             Some(true)
         );
         assert!(workspace_root.join("notes.txt").is_file());
-        assert!(result_text(&delete_response).contains("confirm=true"));
+        assert!(result_text(&delete_response).contains("DESTRUCTIVE_DELETE_DISABLED"));
 
         let dry_delete_req =
             tool_call_request("delete", json!({ "path": "notes.txt", "dry_run": true }));
@@ -4966,6 +5846,12 @@ mod tests {
         assert_eq!(
             structured.get("dryRun").and_then(Value::as_bool),
             Some(true)
+        );
+        assert!(
+            structured
+                .get("confirmationToken")
+                .and_then(Value::as_str)
+                .is_some_and(|token| token.starts_with("delete:"))
         );
 
         let _ = std::fs::remove_dir_all(workspace_root);
@@ -5652,10 +6538,43 @@ mod tests {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-delete-file-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(workspace_root.join(".catdesk")).expect("create catdesk dir");
+        std::fs::write(
+            workspace_root.join(".catdesk").join("config.toml"),
+            "destructive_delete_enabled = true\n",
+        )
+        .expect("write config");
         std::fs::write(workspace_root.join("notes.txt"), "hello world\n").expect("write file");
 
-        let req = tool_call_request("delete", json!({ "path": "notes.txt", "confirm": true }));
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let dry_req = tool_call_request("delete", json!({ "path": "notes.txt", "dry_run": true }));
+        let dry_response = handle_tools_call(
+            &dry_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &None,
+        )
+        .await;
+        assert_no_text_content(&dry_response);
+        let confirmation_token = dry_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("confirmationToken"))
+            .and_then(Value::as_str)
+            .expect("missing confirmation token")
+            .to_string();
+
+        let req = tool_call_request(
+            "delete",
+            json!({
+                "path": "notes.txt",
+                "confirmation_token": confirmation_token
+            }),
+        );
         let response = handle_tools_call(
             &req,
             &workspace_root_str,
