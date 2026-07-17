@@ -511,7 +511,7 @@ async fn post_token_stats_layout(
 }
 
 async fn post_show_detail_mode(
-    State(_s): State<ServerState>,
+    State(s): State<ServerState>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response<Body> {
     let Some(mode_raw) = form.get("mode").map(String::as_str) else {
@@ -541,6 +541,11 @@ async fn post_show_detail_mode(
                 json!({ "ok": false, "error": error.to_string() }).to_string(),
             ))
             .unwrap();
+    }
+
+    {
+        let mut app = s.app.lock().await;
+        app.show_detail_mode = mode;
     }
 
     with_widget_action_cors(Response::builder())
