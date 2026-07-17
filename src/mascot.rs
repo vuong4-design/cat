@@ -1417,7 +1417,8 @@ mod tests {
         let metadata_text = std::fs::read_to_string(archive_dir.join(super::METADATA_FILE_NAME))
             .expect("read metadata");
         assert!(metadata_text.contains("seed = \"0000000000000001\""));
-        let expected_version = format!("generator_version = \"{}\"", env!("CARGO_PKG_VERSION"));
+        let expected_version =
+            format!("generator_version = \"{}\"", crate::app_info::CATDESK_VERSION);
         assert!(metadata_text.contains(&expected_version));
 
         let archive_png = image::open(archive_dir.join(super::CHARACTER_PNG_FILE_NAME))
