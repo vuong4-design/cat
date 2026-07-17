@@ -1615,8 +1615,7 @@ async fn run_settings(
                                 app.log("INFO", "Generated new random MCP slug".into());
                                 app.persist_state_with_log();
                             } else if selected_row == detail_mode_end + 3 {
-                                let current_domain =
-                                    app.ngrok_domain.clone().unwrap_or_default();
+                                let current_domain = app.ngrok_domain.clone().unwrap_or_default();
                                 drop(app);
                                 if let Some(new_domain) = run_prompt(
                                     terminal,
@@ -1628,8 +1627,7 @@ async fn run_settings(
                                     let mut cleaned = new_domain.trim();
                                     if let Some(stripped) = cleaned.strip_prefix("https://") {
                                         cleaned = stripped;
-                                    } else if let Some(stripped) = cleaned.strip_prefix("http://")
-                                    {
+                                    } else if let Some(stripped) = cleaned.strip_prefix("http://") {
                                         cleaned = stripped;
                                     }
                                     cleaned = cleaned.trim_end_matches('/');
