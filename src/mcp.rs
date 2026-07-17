@@ -2573,7 +2573,7 @@ fn current_token_stats_layout() -> TokenStatsLayout {
 fn current_show_detail_mode() -> ShowDetailMode {
     #[cfg(test)]
     {
-        return ShowDetailMode::Expanded;
+        ShowDetailMode::Expanded
     }
     #[cfg(not(test))]
     {
